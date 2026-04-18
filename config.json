@@ -1,0 +1,31 @@
+{
+  "bot": {
+    "prefix": "!",
+    "admin_role": 1493058231210082326,
+    "seller_role": 1493388810468331653,
+    "invoice_channel_id": 1493058457232740382,
+    "logging_channel_id": 1493058511486062735
+  },
+  "crypto": {
+    "receiving_address": "ltc1qh5st48vcp6zazp8f9544s7pv0n6rlg60r32lje",
+    "payment_timeout": 3600,
+    "ltc_confirmations": 1,
+    "poll_interval": 120,
+    "reservation_timeout": 300
+  },
+  "database": {
+    "file": "data/shop_data.db"
+  },
+  "shop": {
+    "restock_rate_limit": 10,
+    "low_stock_threshold": 5,
+    "platform_fee_percent": 0.0
+  },
+  "payouts": {
+    "enabled": false,
+    "minimum_payout": 0.001,
+    "auto_payout_threshold": 0.01,
+    "schedule": "manual",
+    "batch_size": 5
+  }
+}
