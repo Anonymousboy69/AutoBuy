@@ -10,7 +10,8 @@
     "receiving_address": "ltc1qh5st48vcp6zazp8f9544s7pv0n6rlg60r32lje",
     "payment_timeout": 3600,
     "ltc_confirmations": 1,
-    "poll_interval": 120,
+    "poll_interval": 300
+    ,
     "reservation_timeout": 300
   },
   "database": {

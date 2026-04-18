@@ -106,7 +106,7 @@ async def notify_admins_out_of_stock(product: dict, product_id: str, order_id: s
 async def deliver_order(order: dict, oid: str, force_delivery: bool = False):
     """Wrapper for order delivery"""
     from src.commands.handlers import deliver_order as _deliver_order
-    await _deliver_order(
+    return await _deliver_order(
         order, oid, force_delivery,
         fetch_user_callback=bot.fetch_user,
         send_low_stock_alert_callback=send_low_stock_alert,
@@ -273,189 +273,6 @@ async def fetch_ltc_usd_price() -> float | None:
                 return float(data.get("litecoin", {}).get("usd", 0))
     except Exception:
         return None
-
-async def sweep_payment(address_path: str, from_address: str, amount_ltc: Decimal, recipients: list[tuple[str, Decimal]] | None = None) -> tuple[bool, str | None]:
-    if not WALLET_SEED or (not RECEIVING_ADDRESS and not recipients):
-        logging.error("Sweep failed: WALLET_SEED or destination address(es) not configured")
-        return False, None
-    try:
-        from bitcoinlib.mnemonic import Mnemonic
-        from bitcoinlib.keys import HDKey
-        from bitcoinlib.transactions import Transaction, Input, Output
-
-        mnemo = Mnemonic("english")
-        seed_bytes = mnemo.to_seed(WALLET_SEED)
-        root = HDKey.from_seed(seed_bytes, network="litecoin")
-        child_key = root.subkey_for_path(address_path)
-
-        logging.info(f"Derived key for path {address_path}")
-        logging.info("sweep_payment v2 loaded: using bitcoinlib Transaction.sign()")
-
-        addr_url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{from_address}?token={get_next_blockcypher_token()}"
-        async with aiohttp.ClientSession() as s:
-            async with s.get(addr_url) as r:
-                if r.status != 200:
-                    resp = await r.text()
-                    logging.error(f"BlockCypher query failed: {r.status} - {resp[:300]}")
-                    return False, None
-                addr_data = await r.json()
-
-        balance = addr_data.get('balance', 0)
-        logging.info(f"Address balance: {balance} satoshis")
-
-        txrefs = addr_data.get('txrefs', [])
-        confirmed_txs = [tx for tx in txrefs if not tx.get('spent') and tx.get('confirmations', 0) >= LTC_CONFIRMATIONS]
-
-        if not confirmed_txs:
-            logging.warning("No confirmed transactions")
-            return False, None
-
-        inputs = []
-        total_satoshis = 0
-        
-        # Fetch transaction details in parallel with concurrency limit (max 5 concurrent)
-        async def fetch_tx_with_semaphore(s, semaphore, tx_ref):
-            tx_hash = tx_ref.get('tx_hash')
-            async with semaphore:
-                tx_url = f"https://api.blockcypher.com/v1/ltc/main/txs/{tx_hash}?token={get_next_blockcypher_token()}"
-                try:
-                    async with s.get(tx_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                        if r.status == 200:
-                            return await r.json()
-                        else:
-                            logging.warning(f"Failed to fetch tx {tx_hash}: {r.status}")
-                except Exception as e:
-                    logging.warning(f"Error fetching tx {tx_hash}: {e}")
-            return None
-        
-        async with aiohttp.ClientSession() as s:
-            semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent requests
-            
-            # Fetch all tx details concurrently
-            tx_details_list = await asyncio.gather(
-                *[fetch_tx_with_semaphore(s, semaphore, tx_ref) for tx_ref in confirmed_txs],
-                return_exceptions=False
-            )
-            
-            # Process all transaction results
-            for tx_data in tx_details_list:
-                if not tx_data:
-                    continue
-                for idx, output in enumerate(tx_data.get('outputs', [])):
-                    out_addrs = output.get('addresses', [])
-                    if out_addrs and out_addrs[0] == from_address and not output.get('spent_by'):
-                        satoshis = output.get('value', 0)
-                        inputs.append({
-                            'prev_hash': tx_data.get('hash'),
-                            'output_index': idx,
-                            'output_value': satoshis,
-                            'addresses': [from_address],
-                            'script_type': output.get('script_type', 'pay-to-witness-pubkey-hash')
-                        })
-                        total_satoshis += satoshis
-
-        if not inputs:
-            logging.warning("No unspent outputs")
-            return False, None
-
-        fee_satoshis = max(2200, len(inputs) * 1100)
-        outputs: list[dict] = []
-
-        if recipients:
-            total_target_satoshis = 0
-            for address, amount in recipients:
-                amount_decimal = Decimal(amount).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
-                satoshis = int((amount_decimal * Decimal('1e8')).to_integral_value(rounding=ROUND_DOWN))
-                if satoshis <= 0:
-                    continue
-                outputs.append({
-                    'address': address,
-                    'satoshis': satoshis,
-                    'amount': amount_decimal,
-                })
-                total_target_satoshis += satoshis
-
-            if not outputs:
-                logging.warning("No valid recipient outputs")
-                return False, None
-
-            if total_satoshis < total_target_satoshis + fee_satoshis:
-                logging.warning("Not enough funds for requested seller payout outputs")
-                return False, None
-
-            remainder = total_satoshis - total_target_satoshis - fee_satoshis
-            if remainder > 0:
-                outputs[0]['satoshis'] += remainder
-        else:
-            output_satoshis = total_satoshis - fee_satoshis
-            if output_satoshis <= 0:
-                logging.warning("Insufficient balance after fees")
-                return False, None
-            outputs.append({'address': RECEIVING_ADDRESS, 'satoshis': output_satoshis})
-
-        tx_inputs = []
-        for inp in inputs:
-            tx_inputs.append(Input(prev_txid=inp['prev_hash'], output_n=inp['output_index'], value=inp['output_value'], keys=child_key, witness_type='segwit', network='litecoin'))
-
-        tx_outputs = [Output(value=out['satoshis'], address=out['address'], network='litecoin') for out in outputs]
-        tx = Transaction(inputs=tx_inputs, outputs=tx_outputs, witness_type='segwit', network='litecoin')
-
-        logging.info("Signing transaction inputs...")
-        tx.sign(keys=child_key)
-
-        tx_hex = tx.raw_hex()
-        if not tx_hex:
-            logging.error("Failed to generate tx hex")
-            return False, None
-
-        logging.info("Transaction hex generated, broadcasting...")
-        broadcast_url = f"https://api.blockcypher.com/v1/ltc/main/txs/push?token={get_next_blockcypher_token()}"
-        async with aiohttp.ClientSession() as s:
-            async with s.post(broadcast_url, json={"tx": tx_hex}) as r:
-                resp_text = await r.text()
-                if r.status not in (200, 201):
-                    logging.error(f"Broadcast failed: {r.status}")
-                    logging.error(f"    {resp_text[:300]}")
-                    return False, None
-                result = await r.json() if resp_text else {}
-
-        txid = result.get('tx', {}).get('hash') or result.get('hash')
-        if not txid:
-            logging.error("No txid in response")
-            logging.error(f"Broadcast result: {result}")
-            return False, None
-
-        logging.info(f"Sweep broadcast succeeded: {txid}")
-        
-        # Verify transaction actually exists on blockchain (don't trust API alone)
-        logging.info(f"Verifying transaction {txid} on blockchain...")
-        await asyncio.sleep(3)  # Wait for transaction to propagate
-        
-        verify_url = f"https://api.blockcypher.com/v1/ltc/main/txs/{txid}?token={get_next_blockcypher_token()}"
-        try:
-            async with aiohttp.ClientSession() as verify_session:
-                async with verify_session.get(verify_url, timeout=aiohttp.ClientTimeout(total=5)) as verify_r:
-                    if verify_r.status == 200:
-                        verify_result = await verify_r.json()
-                        if verify_result.get('hash') == txid or verify_result.get('tx', {}).get('hash') == txid:
-                            logging.info(f"✅ Transaction {txid} verified on blockchain")
-                            return True, txid
-                        else:
-                            logging.warning(f"Transaction {txid} returned from API but data mismatch on verification")
-                            return True, txid  # Still trust it, just log warning
-                    else:
-                        logging.warning(f"Verification query returned {verify_r.status}, assuming broadcast succeeded")
-                        return True, txid  # Give benefit of doubt if verification fails
-        except Exception as e:
-            logging.warning(f"Could not verify transaction {txid} on blockchain: {e}, but trusting broadcast succeeded")
-            return True, txid  # Don't fail just because verification errored
-
-    except Exception as e:
-        logging.error(f"Sweep error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False, None
-
 
 async def update_invoice_message(order: dict, balance_info: dict | None):
     """Wrapper for order_manager.update_invoice_message"""
@@ -730,15 +547,20 @@ webhook_server_started = False
 webhook_runner = None
 
 
-def _get_blockcypher_webhook_path() -> str:
-    return f"/webhook/blockcypher/{WEBHOOK_SECRET}" if WEBHOOK_SECRET else "/webhook/blockcypher"
-
-
 async def _webhook_health(request):
     return web.Response(text="ok")
 
 
 async def _handle_blockcypher_webhook(request):
+    order_id = request.match_info.get("order_id")
+    secret = request.match_info.get("secret")
+
+    if not order_id:
+        return web.Response(status=400, text="Missing order ID")
+
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        return web.Response(status=403, text="Forbidden")
+
     try:
         payload = await request.json()
     except Exception:
@@ -753,12 +575,13 @@ async def _handle_blockcypher_webhook(request):
     if not address:
         return web.Response(status=400, text="Missing address")
 
-    logging.info(f"Received BlockCypher webhook for {address}")
+    logging.info(f"Received BlockCypher webhook for order {order_id} at address {address}")
 
     from src.services.tasks import handle_blockcypher_webhook_event
 
     try:
         processed = await handle_blockcypher_webhook_event(
+            order_id,
             address,
             bot,
             update_invoice_message,
@@ -771,7 +594,7 @@ async def _handle_blockcypher_webhook(request):
         )
         return web.Response(status=200, text="processed" if processed else "no orders")
     except Exception as e:
-        logging.error(f"Webhook handler error for {address}: {e}")
+        logging.error(f"Webhook handler error for order {order_id}: {e}")
         return web.Response(status=500, text="internal error")
 
 
@@ -782,7 +605,10 @@ async def start_webhook_server():
 
     app = web.Application()
     app.router.add_get("/webhook/health", _webhook_health)
-    app.router.add_post(_get_blockcypher_webhook_path(), _handle_blockcypher_webhook)
+    if WEBHOOK_SECRET:
+        app.router.add_post("/webhook/{order_id}/{secret}", _handle_blockcypher_webhook)
+    else:
+        app.router.add_post("/webhook/{order_id}", _handle_blockcypher_webhook)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -791,7 +617,10 @@ async def start_webhook_server():
 
     webhook_runner = runner
     webhook_server_started = True
-    logging.info(f"✅ Webhook server started at http://{WEBHOOK_HOST}:{WEBHOOK_PORT}{_get_blockcypher_webhook_path()}")
+    route_description = "/webhook/{order_id}"
+    if WEBHOOK_SECRET:
+        route_description += "/<secret>"
+    logging.info(f"✅ Webhook server started at http://{WEBHOOK_HOST}:{WEBHOOK_PORT}{route_description}")
 
 
 # ─────────────────────────────────────────────
@@ -1602,6 +1431,16 @@ async def slash_refund(interaction: discord.Interaction, order_id: str, refund_t
 async def slash_checkbalance(interaction: discord.Interaction, order_id: str):
     await command_handlers.slash_checkbalance(interaction, order_id)
 
+@bot.tree.command(name="sweep", description="[Admin] Sweep remaining funds from an order address")
+@app_commands.describe(order_id="Order ID (first 8 characters)")
+async def slash_sweep(interaction: discord.Interaction, order_id: str):
+    await command_handlers.slash_sweep(interaction, order_id)
+
+@bot.tree.command(name="checktxid", description="[Admin] Check Litecoin transaction details by TXID")
+@app_commands.describe(txid="Litecoin transaction ID")
+async def slash_checktxid(interaction: discord.Interaction, txid: str):
+    await command_handlers.slash_checktxid(interaction, txid)
+
 @bot.tree.command(name="sellerrevenue", description="[Admin] Check seller revenue from their restocked items")
 @app_commands.describe(user="The Discord user to check revenue for", platform_fee="Platform fee percentage (optional, uses config default)")
 async def slash_seller_revenue(interaction: discord.Interaction, user: discord.Member, platform_fee: float = None):
@@ -1618,6 +1457,234 @@ async def slash_seller_revenue(interaction: discord.Interaction, user: discord.M
 ])
 async def slash_payouts(interaction: discord.Interaction, action: str, user: discord.Member = None):
     await command_handlers.slash_payouts(interaction, action, user, process_seller_payout, process_all_payouts)
+
+@bot.tree.command(name="recover", description="[Admin] Mark expired order as paid and deliver (if payment exists)")
+@app_commands.describe(order_id="Order ID (or prefix) to recover")
+async def slash_recover(interaction: discord.Interaction, order_id: str):
+    """Recover stuck expired orders with detected payments"""
+    if not admin_check_interaction(interaction):
+        await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
+        return
+    
+    await interaction.response.defer(ephemeral=True)
+    try:
+        order_id = order_id.strip()
+        if order_id.lower().startswith(('/recover', '!recover')):
+            parts = order_id.replace('!', ' ').replace('/', ' ').split()
+            if len(parts) > 1:
+                order_id = parts[-1]
+
+        # Search for order by ID prefix (like cancel does)
+        conn = get_db(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            "SELECT * FROM orders WHERE id LIKE ? ORDER BY created_at DESC LIMIT 1",
+            (f"{order_id}%",)
+        )
+        row = c.fetchone()
+        conn.close()
+        
+        order = dict(row) if row else None
+        
+        if not order:
+            await interaction.followup.send(f"❌ Order `{order_id}*` not found.", ephemeral=True)
+            return
+        
+        if order['status'] not in ('expired', 'pending', 'paid', 'failed'):
+            await interaction.followup.send(
+                f"❌ Cannot recover order in status `{order['status']}`. Only expired/pending/paid/failed orders can be recovered.",
+                ephemeral=True
+            )
+            return
+        
+        # Check if payment exists
+        balance_info = await get_address_balance(order['ltc_address'])
+        if not balance_info:
+            await interaction.followup.send("❌ Could not fetch balance for this order.", ephemeral=True)
+            return
+        
+        confirmed = litoshi_to_ltc(balance_info.get('balance', 0))
+        expected = Decimal(str(order['price_ltc'])).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+        
+        if confirmed <= 0:
+            await interaction.followup.send(
+                f"❌ No payment found on this address. Cannot recover.\n\n**Address**: `{order['ltc_address']}`",
+                ephemeral=True
+            )
+            return
+        
+        if confirmed < expected:
+            # Force delivery on partial payment because admin manually requested recovery.
+            now = datetime.now(timezone.utc).timestamp()
+            conn = get_db(DB_FILE)
+            c = conn.cursor()
+            c.execute(
+                "UPDATE orders SET status = ?, paid_at = ?, payment_detected_at = ? WHERE id = ?",
+                ('paid', now, now, order['id'])
+            )
+            conn.commit()
+            conn.close()
+
+            order['status'] = 'paid'
+            order['paid_at'] = now
+
+            try:
+                await update_invoice_message(order, balance_info)
+            except Exception as e:
+                logging.warning(f"Could not update invoice during recovery: {e}")
+
+            try:
+                delivery_success = await deliver_order(order, order['id'], force_delivery=True)
+            except Exception as e:
+                logging.error(f"Delivery error during recovery: {e}")
+                await interaction.followup.send(
+                    f"⚠️ Order marked paid but delivery had an error: {str(e)[:100]}",
+                    ephemeral=True
+                )
+                return
+
+            if not delivery_success:
+                await interaction.followup.send(
+                    f"⚠️ Partial payment detected and order `{order['id'][:8]}` was marked paid, but delivery failed."
+                    f" Please check stock availability or review the order manually.",
+                    ephemeral=True
+                )
+                return
+
+            # Sweep any confirmed balance from the order address to the receiving wallet.
+            address_path = order.get('address_path')
+            if not address_path:
+                address_path = find_address_path_by_address(DB_FILE, order['ltc_address'], WALLET_SEED)
+                if address_path:
+                    conn = get_db(DB_FILE)
+                    c = conn.cursor()
+                    c.execute('UPDATE orders SET address_path = ? WHERE id = ?', (address_path, order['id']))
+                    conn.commit()
+                    conn.close()
+
+            try:
+                sweep_success, sweep_txid = await sweep_payment(
+                    db_file=DB_FILE,
+                    address_path=address_path,
+                    from_address=order['ltc_address'],
+                    amount_ltc=Decimal(str(order['price_ltc'])),
+                    wallet_seed=WALLET_SEED,
+                    receiving_address=RECEIVING_ADDRESS,
+                    blockcypher_token=get_next_blockcypher_token(),
+                    ltc_confirmations=LTC_CONFIRMATIONS,
+                    recipients=None,
+                )
+                if sweep_success:
+                    now_sweep = datetime.now(timezone.utc).timestamp()
+                    conn = get_db(DB_FILE)
+                    c = conn.cursor()
+                    c.execute(
+                        'UPDATE orders SET swept_at = ?, sweep_txid = ?, sweep_attempts = ?, last_sweep_attempt = ? WHERE id = ?',
+                        (now_sweep, sweep_txid, 1, now_sweep, order['id'])
+                    )
+                    conn.commit()
+                    conn.close()
+                else:
+                    logging.warning(f"Sweep failed during recovery for order {order['id'][:8]}")
+            except Exception as e:
+                logging.error(f"Sweep error during recovery: {e}", exc_info=True)
+
+            log_audit(order['product_id'], 'order_recovered', str(interaction.user.id), interaction.user.name, details=f"Order {order['id'][:8]} recovered from expired status with partial payment and delivered.")
+
+            await interaction.followup.send(
+                f"✅ Partial payment detected and order `{order['id'][:8]}` recovered and delivered.\n"
+                f"**Expected**: {format_ltc(expected)} LTC\n"
+                f"**Confirmed**: {format_ltc(confirmed)} LTC\n"
+                f"**Shortfall**: {format_ltc(expected - confirmed)} LTC",
+                ephemeral=True
+            )
+            return
+
+        # Payment is confirmed, mark as paid and deliver
+        now = datetime.now(timezone.utc).timestamp()
+        conn = get_db(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            "UPDATE orders SET status = ?, paid_at = ?, payment_detected_at = ? WHERE id = ?",
+            ('paid', now, now, order['id'])
+        )
+        conn.commit()
+        conn.close()
+        
+        order['status'] = 'paid'
+        order['paid_at'] = now
+        
+        try:
+            await update_invoice_message(order, balance_info)
+        except Exception as e:
+            logging.warning(f"Could not update invoice during recovery: {e}")
+        
+        try:
+            delivery_success = await deliver_order(order, order['id'], force_delivery=True)
+        except Exception as e:
+            logging.error(f"Delivery error during recovery: {e}")
+            await interaction.followup.send(
+                f"⚠️ Order marked paid but delivery had an error: {str(e)[:100]}",
+                ephemeral=True
+            )
+            return
+
+        if not delivery_success:
+            await interaction.followup.send(
+                f"⚠️ Order `{order['id'][:8]}` was marked paid, but delivery failed."
+                f" Please check stock availability or review the order manually.",
+                ephemeral=True
+            )
+            return
+
+        address_path = order.get('address_path')
+        if not address_path:
+            address_path = find_address_path_by_address(DB_FILE, order['ltc_address'], WALLET_SEED)
+            if address_path:
+                conn = get_db(DB_FILE)
+                c = conn.cursor()
+                c.execute('UPDATE orders SET address_path = ? WHERE id = ?', (address_path, order['id']))
+                conn.commit()
+                conn.close()
+
+        try:
+            sweep_success, sweep_txid = await sweep_payment(
+                db_file=DB_FILE,
+                address_path=address_path,
+                from_address=order['ltc_address'],
+                amount_ltc=Decimal(str(order['price_ltc'])),
+                wallet_seed=WALLET_SEED,
+                receiving_address=RECEIVING_ADDRESS,
+                blockcypher_token=get_next_blockcypher_token(),
+                ltc_confirmations=LTC_CONFIRMATIONS,
+                recipients=None,
+            )
+            if sweep_success:
+                now_sweep = datetime.now(timezone.utc).timestamp()
+                conn = get_db(DB_FILE)
+                c = conn.cursor()
+                c.execute(
+                    'UPDATE orders SET swept_at = ?, sweep_txid = ?, sweep_attempts = ?, last_sweep_attempt = ? WHERE id = ?',
+                    (now_sweep, sweep_txid, 1, now_sweep, order['id'])
+                )
+                conn.commit()
+                conn.close()
+            else:
+                logging.warning(f"Sweep failed during recovery for order {order['id'][:8]}")
+        except Exception as e:
+            logging.error(f"Sweep error during recovery: {e}", exc_info=True)
+        
+        log_audit(order['product_id'], 'order_recovered', str(interaction.user.id), interaction.user.name, details=f"Order {order['id'][:8]} recovered from expired status and delivered.")
+        
+        await interaction.followup.send(
+            f"✅ Order `{order['id'][:8]}` recovered and delivered!\n\n"
+            f"**Payment**: {format_ltc(confirmed)} LTC ✅",
+            ephemeral=True
+        )
+        
+    except Exception as e:
+        logging.error(f"Recovery error: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ Recovery failed: {str(e)[:100]}", ephemeral=True)
 
 # ─────────────────────────────────────────────
 #  ERROR HANDLER

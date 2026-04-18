@@ -326,118 +326,168 @@ class InvoiceApproveView(discord.ui.View):
 
     @discord.ui.button(label="💰 Sweep & Deliver", style=discord.ButtonStyle.secondary, custom_id="invoice_sweep_deliver")
     async def sweep_and_deliver(self, interaction: discord.Interaction, button: discord.ui.Button):
-        order = get_order(DB_FILE, self.order_id)
-        if not order:
-            await interaction.response.send_message("❌ Order not found.", ephemeral=True)
-            return
-
-        if order['status'] == 'delivered':
-            await interaction.response.send_message("✅ This order has already been delivered.", ephemeral=True)
-            return
-
-        quantity = int(order.get('quantity', 1))
-        conn = get_db(DB_FILE)
-        c = conn.cursor()
-        c.execute('SELECT COUNT(*) FROM stock_items WHERE product_id = ? AND status = "pending"',
-                  (order['product_id'],))
-        available_stock = c.fetchone()[0]
-        conn.close()
-
-        if available_stock < quantity:
-            await interaction.response.send_message(
-                f"❌ **Cannot sweep:** Order requires {quantity} item(s) but only {available_stock} pending item(s) available. Stock must be available BEFORE sweeping.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
         try:
-            product = get_product(DB_FILE, order['product_id'])
-            await interaction.message.edit(
-                embed=build_invoice_embed(order, product, {'balance': 0, 'unconfirmed_balance': 0}, processing=True),
-                view=InvoiceApproveView(self.order_id, disabled=True, show_refund=False),
-            )
-        except Exception as e:
-            logging.warning(f"Could not update invoice message during sweep: {e}")
-
-        balance_info = await get_address_balance(order['ltc_address'])
-        if not balance_info:
-            await interaction.followup.send("❌ Could not fetch balance. Try again later.", ephemeral=True)
-            return
-
-        confirmed = litoshi_to_ltc(balance_info.get("balance", 0))
-        expected = Decimal(str(order['price_ltc'])).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
-
-        if confirmed <= 0:
-            await interaction.followup.send("❌ No confirmed payment found on this address.", ephemeral=True)
-            return
-
-        if confirmed < expected:
-            em = discord.Embed(
-                title="💰 Partial Payment Detected",
-                description=f"This order requires {format_ltc(expected)} LTC but only {format_ltc(confirmed)} LTC is confirmed.",
-                color=COLORS['warning']
-            )
-            em.add_field(name="Shortfall", value=f"{format_ltc(expected - confirmed)} LTC", inline=True)
-            em.add_field(name="Action", value="Click 'Confirm' to accept partial payment and deliver.", inline=False)
-            view = PartialPaymentConfirmView(self.order_id, confirmed, balance_info)
-            await interaction.followup.send(embed=em, view=view, ephemeral=True)
-            return
-
-        address_path = order.get("address_path")
-        if not address_path:
-            address_path = find_address_path_by_address(order['ltc_address'])
-            if address_path:
-                conn = get_db(DB_FILE)
-                c = conn.cursor()
-                c.execute('UPDATE orders SET address_path = ? WHERE id = ?', (address_path, self.order_id))
-                conn.commit()
-                conn.close()
-
-        if address_path:
-            recipients, error = build_seller_payout_from_pending_stock(DB_FILE, order, CONFIG['shop'].get('platform_fee_percent', 0.0), RECEIVING_ADDRESS)
-            if error:
-                logging.warning(f"Seller direct payout unavailable: {error}")
-                recipients = None
-
-            swept, sweep_txid = await sweep_payment(
-                DB_FILE,
-                address_path,
-                order['ltc_address'],
-                confirmed,
-                WALLET_SEED,
-                RECEIVING_ADDRESS,
-                get_next_blockcypher_token(),
-                LTC_CONFIRMATIONS,
-                recipients=recipients,
-            )
-            if not swept:
-                await interaction.followup.send("❌ Sweep failed. Please try again or check logs.", ephemeral=True)
+            order = get_order(DB_FILE, self.order_id)
+            if not order:
+                await interaction.response.send_message("❌ Order not found.", ephemeral=True)
                 return
 
-            assigned = assign_order_stock_to_order(DB_FILE, order)
-            if not assigned:
-                logging.warning(f"Could not assign stock to order {order['id']} for payout.")
-        else:
+            if order['status'] == 'delivered':
+                await interaction.response.send_message("✅ This order has already been delivered.", ephemeral=True)
+                return
+
+            quantity = int(order.get('quantity', 1))
+            conn = get_db(DB_FILE)
+            c = conn.cursor()
+            c.execute('SELECT COUNT(*) FROM stock_items WHERE product_id = ? AND status = "pending"',
+                      (order['product_id'],))
+            available_stock = c.fetchone()[0]
+            conn.close()
+
+            if available_stock < quantity:
+                await interaction.response.send_message(
+                    f"❌ **Cannot sweep:** Order requires {quantity} item(s) but only {available_stock} pending item(s) available. Stock must be available BEFORE sweeping.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True)
+            
+            try:
+                product = get_product(DB_FILE, order['product_id'])
+                await interaction.message.edit(
+                    embed=build_invoice_embed(order, product, {'balance': 0, 'unconfirmed_balance': 0}, processing=True),
+                    view=InvoiceApproveView(self.order_id, disabled=True, show_refund=False),
+                )
+            except Exception as e:
+                logging.warning(f"Could not update invoice message during sweep: {e}")
+
+            try:
+                balance_info = await asyncio.wait_for(get_address_balance(order['ltc_address']), timeout=10)
+            except asyncio.TimeoutError:
+                await interaction.followup.send("❌ Balance check timed out. Try again in a moment.", ephemeral=True)
+                return
+            except Exception as e:
+                logging.error(f"Balance fetch error for sweep: {e}")
+                await interaction.followup.send(f"❌ Could not fetch balance: {str(e)[:100]}", ephemeral=True)
+                return
+
+            if not balance_info:
+                await interaction.followup.send("❌ Could not fetch balance. Try again later.", ephemeral=True)
+                return
+
+            confirmed = litoshi_to_ltc(balance_info.get("balance", 0))
+            expected = Decimal(str(order['price_ltc'])).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN)
+
+            if confirmed <= 0:
+                await interaction.followup.send("❌ No confirmed payment found on this address.", ephemeral=True)
+                return
+
+            if confirmed < expected:
+                em = discord.Embed(
+                    title="💰 Partial Payment Detected",
+                    description=f"This order requires {format_ltc(expected)} LTC but only {format_ltc(confirmed)} LTC is confirmed.",
+                    color=COLORS['warning']
+                )
+                em.add_field(name="Shortfall", value=f"{format_ltc(expected - confirmed)} LTC", inline=True)
+                em.add_field(name="Action", value="Click 'Confirm' to accept partial payment and deliver.", inline=False)
+                view = PartialPaymentConfirmView(self.order_id, confirmed, balance_info)
+                await interaction.followup.send(embed=em, view=view, ephemeral=True)
+                return
+
+            address_path = order.get("address_path")
+            if not address_path:
+                try:
+                    address_path = find_address_path_by_address(order['ltc_address'])
+                    if address_path:
+                        conn = get_db(DB_FILE)
+                        c = conn.cursor()
+                        c.execute('UPDATE orders SET address_path = ? WHERE id = ?', (address_path, self.order_id))
+                        conn.commit()
+                        conn.close()
+                except Exception as e:
+                    logging.warning(f"Could not find address path: {e}")
+                    address_path = None
+
             sweep_txid = None
+            if address_path:
+                try:
+                    recipients, error = build_seller_payout_from_pending_stock(DB_FILE, order, CONFIG['shop'].get('platform_fee_percent', 0.0), RECEIVING_ADDRESS)
+                    if error:
+                        logging.warning(f"Seller direct payout unavailable: {error}")
+                        recipients = None
 
-        now = datetime.now(timezone.utc).timestamp()
-        conn = get_db(DB_FILE)
-        c = conn.cursor()
-        c.execute('''UPDATE orders SET status = ?, paid_at = ?, swept_at = ?, sweep_txid = ?, sweep_attempts = sweep_attempts + 1, last_sweep_attempt = ?
-                     WHERE id = ?''',
-                  ('paid', now, now, sweep_txid, now, self.order_id))
-        conn.commit()
-        conn.close()
+                    swept, sweep_txid = await asyncio.wait_for(
+                        sweep_payment(
+                            DB_FILE,
+                            address_path,
+                            order['ltc_address'],
+                            confirmed,
+                            WALLET_SEED,
+                            RECEIVING_ADDRESS,
+                            get_next_blockcypher_token(),
+                            LTC_CONFIRMATIONS,
+                            recipients=recipients,
+                        ),
+                        timeout=30
+                    )
+                    if not swept:
+                        await interaction.followup.send("❌ Sweep failed. Please try again or check logs.", ephemeral=True)
+                        return
 
-        order['status'] = 'paid'
-        order['paid_at'] = now
-        order['swept_at'] = now
-        order['sweep_txid'] = sweep_txid
-        await update_invoice_message(order, balance_info)
-        await deliver_order(order, self.order_id)
+                    assigned = assign_order_stock_to_order(DB_FILE, order)
+                    if not assigned:
+                        logging.warning(f"Could not assign stock to order {order['id']} for payout.")
+                except asyncio.TimeoutError:
+                    await interaction.followup.send("❌ Sweep operation timed out. Please try again.", ephemeral=True)
+                    return
+                except Exception as e:
+                    logging.error(f"Sweep payment error: {e}", exc_info=True)
+                    await interaction.followup.send(f"❌ Sweep failed: {str(e)[:100]}", ephemeral=True)
+                    return
+            else:
+                logging.warning(f"No address path for order {self.order_id}, skipping sweep")
 
-        await interaction.followup.send("✅ Funds swept and order delivered.", ephemeral=True)
+            now = datetime.now(timezone.utc).timestamp()
+            conn = get_db(DB_FILE)
+            c = conn.cursor()
+            c.execute('''UPDATE orders SET status = ?, paid_at = ?, swept_at = ?, sweep_txid = ?, sweep_attempts = sweep_attempts + 1, last_sweep_attempt = ?
+                         WHERE id = ?''',
+                      ('paid', now, now, sweep_txid, now, self.order_id))
+            conn.commit()
+            conn.close()
+
+            order['status'] = 'paid'
+            order['paid_at'] = now
+            order['swept_at'] = now
+            order['sweep_txid'] = sweep_txid
+            
+            try:
+                await update_invoice_message(order, balance_info)
+            except Exception as e:
+                logging.warning(f"Could not update invoice: {e}")
+            
+            try:
+                await deliver_order(order, self.order_id)
+            except Exception as e:
+                logging.error(f"Delivery error: {e}", exc_info=True)
+                await interaction.followup.send(f"⚠️ Order marked paid but delivery had an error: {str(e)[:100]}", ephemeral=True)
+                return
+
+            await interaction.followup.send("✅ Funds swept and order delivered.", ephemeral=True)
+            
+        except Exception as e:
+            logging.error(f"Sweep & Deliver handler error: {e}", exc_info=True)
+            if not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(f"❌ Unexpected error: {str(e)[:100]}", ephemeral=True)
+                except Exception:
+                    pass
+            else:
+                try:
+                    await interaction.followup.send(f"❌ Unexpected error: {str(e)[:100]}", ephemeral=True)
+                except Exception:
+                    pass
 
 
 class OrderCancelView(discord.ui.View):

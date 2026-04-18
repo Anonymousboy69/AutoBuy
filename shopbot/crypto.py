@@ -91,6 +91,29 @@ async def register_blockcypher_webhook(address: str, callback_url: str, token: s
         return None
 
 
+async def delete_blockcypher_webhook(hook_id: str, token: str = None) -> bool:
+    if not hook_id:
+        logging.debug("No BlockCypher hook ID provided for deletion")
+        return False
+
+    url = f"https://api.blockcypher.com/v1/ltc/main/hooks/{hook_id}"
+    if token:
+        url += f"?token={token}"
+
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with await s.delete(url) as r:
+                text = await r.text()
+                if r.status in (200, 204):
+                    logging.info(f"Deleted BlockCypher webhook {hook_id}")
+                    return True
+                logging.warning(f"BlockCypher webhook deletion failed: {r.status} {text[:300]}")
+                return False
+    except Exception as e:
+        logging.warning(f"BlockCypher webhook deletion error: {e}")
+        return False
+
+
 def get_wallet_from_seed(wallet_seed: str):
     if not wallet_seed:
         return None
@@ -693,3 +716,30 @@ async def sweep_payment(
         import traceback
         traceback.print_exc()
         return False
+
+
+async def get_transaction_details(txid: str, blockcypher_token: str = None) -> dict | None:
+    """Get Litecoin transaction details from BlockCypher."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                      '(KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+    }
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    url = f"https://api.blockcypher.com/v1/ltc/main/txs/{txid}"
+    if blockcypher_token:
+        url += f"?token={blockcypher_token}"
+
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        try:
+            async with await _fetch_get(session, url) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    return data
+                else:
+                    logging.warning(f"BlockCypher transaction query failed: {r.status} for {txid}")
+                    return None
+        except Exception as e:
+            logging.error(f"Error fetching transaction {txid}: {e}")
+            return None

@@ -2,6 +2,7 @@
 import asyncio
 import discord
 from discord import app_commands
+from discord.ext import commands
 import logging
 import uuid
 import io
@@ -31,6 +32,7 @@ from src.database.wrappers import (
     reserve_stock_items,
     release_reserved_stock,
     get_reserved_stock_items_for_order,
+    assign_order_stock_to_order,
     normalize_product_id,
     get_order,
 )
@@ -42,6 +44,9 @@ from shopbot.crypto import (
     litoshi_to_ltc,
     get_address_balance,
     register_blockcypher_webhook,
+    delete_blockcypher_webhook,
+    find_address_path_by_address,
+    sweep_payment,
 )
 from shopbot.shop import ShopPage, get_stock_status
 from utils import (
@@ -51,6 +56,8 @@ from utils import (
     INVOICE_CHANNEL_ID,
     DB_FILE,
     WALLET_SEED,
+    RECEIVING_ADDRESS,
+    LTC_CONFIRMATIONS,
     CONFIG,
     admin_check_interaction,
     seller_check_interaction,
@@ -387,6 +394,18 @@ async def do_cancel_order(
     conn.commit()
     conn.close()
 
+    if order.get('blockcypher_hook_id'):
+        try:
+            deleted = await delete_blockcypher_webhook(order['blockcypher_hook_id'], get_next_blockcypher_token())
+            if deleted:
+                conn = get_db_callback(DB_FILE)
+                c = conn.cursor()
+                c.execute('UPDATE orders SET blockcypher_hook_id = NULL WHERE id = ?', (order['id'],))
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            logging.warning(f"Failed to delete BlockCypher webhook for canceled order {order['id'][:8]}: {e}")
+
     order['status'] = 'canceled'
     try:
         await update_invoice_message_callback(order, None)
@@ -681,7 +700,7 @@ async def process_buy(
         conn.close()
 
         if WEBHOOK_BASE_URL:
-            webhook_path = f"/webhook/blockcypher/{WEBHOOK_SECRET}" if WEBHOOK_SECRET else "/webhook/blockcypher"
+            webhook_path = f"/webhook/{oid}/{WEBHOOK_SECRET}" if WEBHOOK_SECRET else f"/webhook/{oid}"
             webhook_url = f"{WEBHOOK_BASE_URL}{webhook_path}"
             try:
                 hook_response = await register_blockcypher_webhook(ltc_addr, webhook_url, get_next_blockcypher_token(), BLOCKCYPHER_WEBHOOK_EVENT)
@@ -1331,6 +1350,163 @@ async def slash_checkbalance(interaction: discord.Interaction, order_id: str):
 
     await interaction.followup.send(embed=em, ephemeral=True)
 
+async def slash_sweep(interaction: discord.Interaction, order_id: str):
+    if not admin_check_interaction(interaction):
+        await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    order = None
+    for o in all_orders():
+        if o['id'].startswith(order_id):
+            order = o
+            break
+
+    if not order:
+        await interaction.followup.send("❌ Order not found.", ephemeral=True)
+        return
+
+    balance_info = await get_address_balance(order['ltc_address'])
+    if not balance_info:
+        await interaction.followup.send("❌ Could not check balance.", ephemeral=True)
+        return
+
+    confirmed = litoshi_to_ltc(balance_info.get('balance', 0))
+    if confirmed <= 0:
+        await interaction.followup.send("❌ No confirmed payment found on this address.", ephemeral=True)
+        return
+
+    address_path = order.get('address_path')
+    if not address_path:
+        address_path = find_address_path_by_address(DB_FILE, order['ltc_address'], WALLET_SEED)
+        if address_path:
+            conn = get_db(DB_FILE)
+            c = conn.cursor()
+            c.execute('UPDATE orders SET address_path = ? WHERE id = ?', (address_path, order['id']))
+            conn.commit()
+            conn.close()
+
+    if not address_path:
+        await interaction.followup.send(
+            "❌ Could not determine address path for this order. Manual sweep requires the address derivation index.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        swept, sweep_txid = await sweep_payment(
+            db_file=DB_FILE,
+            address_path=address_path,
+            from_address=order['ltc_address'],
+            amount_ltc=confirmed,
+            wallet_seed=WALLET_SEED,
+            receiving_address=RECEIVING_ADDRESS,
+            blockcypher_token=get_next_blockcypher_token(),
+            ltc_confirmations=LTC_CONFIRMATIONS,
+            recipients=None,
+        )
+    except Exception as e:
+        logging.error(f"Sweep failed for order {order['id'][:8]}: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ Sweep failed: {str(e)[:100]}", ephemeral=True)
+        return
+
+    now = datetime.now(timezone.utc).timestamp()
+    conn = get_db(DB_FILE)
+    c = conn.cursor()
+    c.execute(
+        'UPDATE orders SET swept_at = ?, sweep_txid = ?, sweep_attempts = COALESCE(sweep_attempts, 0) + 1, last_sweep_attempt = ? WHERE id = ?',
+        (now, sweep_txid, now, order['id'])
+    )
+    conn.commit()
+    conn.close()
+
+    if swept:
+        await interaction.followup.send(
+            f"✅ Swept {format_ltc(confirmed)} LTC from order {order['id'][:8]} to the receiving wallet.\n"
+            f"TXID: `{sweep_txid}`",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            "⚠️ Sweep attempt completed but did not broadcast successfully. Check the bot logs for details.",
+            ephemeral=True,
+        )
+
+
+async def slash_checktxid(interaction: discord.Interaction, txid: str):
+    """Check Litecoin transaction details by TXID"""
+    if not admin_check_interaction(interaction):
+        await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        from shopbot.crypto import get_transaction_details
+        from utils.config import get_next_blockcypher_token
+        
+        tx_data = await get_transaction_details(txid, get_next_blockcypher_token())
+        
+        if not tx_data:
+            await interaction.followup.send(f"❌ Transaction `{txid}` not found on the blockchain.", ephemeral=True)
+            return
+
+        # Parse transaction data
+        confirmations = tx_data.get('confirmations', 0)
+        total_in = Decimal(str(tx_data.get('total', 0))) / Decimal('100000000')  # Convert satoshis to LTC
+        total_out = Decimal(str(tx_data.get('total_out', 0))) / Decimal('100000000')
+        received = Decimal(str(tx_data.get('received', ''))) if tx_data.get('received') else None
+        
+        inputs = tx_data.get('inputs', [])
+        outputs = tx_data.get('outputs', [])
+        
+        em = discord.Embed(
+            title=f"📊 Transaction Details",
+            description=f"`{txid}`",
+            color=COLORS["info"],
+        )
+        
+        # Status
+        if confirmations >= 1:
+            status = f"✅ Confirmed ({confirmations} confirmation{'s' if confirmations != 1 else ''})"
+        else:
+            status = "⏳ Unconfirmed (0 confirmations)"
+        
+        em.add_field(name="Status", value=status, inline=True)
+        em.add_field(name="Total Input", value=f"{format_ltc(total_in)} LTC", inline=True)
+        em.add_field(name="Total Output", value=f"{format_ltc(total_out)} LTC", inline=True)
+        
+        # Inputs
+        if inputs:
+            input_str = ""
+            for i, inp in enumerate(inputs[:3], 1):  # Show first 3
+                addr = inp.get('addresses', ['unknown'])[0] if inp.get('addresses') else 'unknown'
+                output_index = inp.get('output_index', '?')
+                input_str += f"{i}. `{addr[:12]}...` (UTXO #{output_index})\n"
+            if len(inputs) > 3:
+                input_str += f"... and {len(inputs) - 3} more input(s)"
+            em.add_field(name="Inputs", value=input_str or "None", inline=False)
+        
+        # Outputs
+        if outputs:
+            output_str = ""
+            for i, out in enumerate(outputs[:3], 1):  # Show first 3
+                addr = out.get('addresses', ['unknown'])[0] if out.get('addresses') else 'unknown'
+                amount = Decimal(str(out.get('output_value', 0))) / Decimal('100000000')
+                output_str += f"{i}. `{addr[:12]}...` → {format_ltc(amount)} LTC\n"
+            if len(outputs) > 3:
+                output_str += f"... and {len(outputs) - 3} more output(s)"
+            em.add_field(name="Outputs", value=output_str or "None", inline=False)
+        
+        em.set_footer(text=f"Transaction verified on Litecoin blockchain via BlockCypher")
+        
+        await interaction.followup.send(embed=em, ephemeral=True)
+        
+    except Exception as e:
+        logging.error(f"Error checking transaction {txid}: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ Error checking transaction: {str(e)[:100]}", ephemeral=True)
+
 
 async def slash_seller_revenue(interaction: discord.Interaction, user: discord.Member, platform_fee: float = None):
     if not admin_check_interaction(interaction):
@@ -1642,11 +1818,11 @@ async def deliver_order(
 ):
     """Deliver an order to the user"""
     if order.get('status') == 'delivered':
-        return
+        return True
 
     product = get_product(order["product_id"])
     if not product:
-        return
+        return False
 
     if not force_delivery:
         balance_info = await get_address_balance(order["ltc_address"])
@@ -1661,6 +1837,11 @@ async def deliver_order(
 
     # Get quantity from order
     quantity = int(order.get("quantity", 1))
+
+    if force_delivery:
+        assigned = assign_order_stock_to_order(order)
+        if assigned:
+            logging.info(f"Assigned stock for forced delivery of order {oid[:8]}")
 
     c.execute('''SELECT id, content FROM stock_items
                  WHERE order_id = ? AND status = 'delivered'
@@ -1771,6 +1952,8 @@ async def deliver_order(
 
     except Exception as e:
         logging.error(f"Could not DM user {order['user_id']}: {e}")
+
+    return bool(delivery_items)
 
 
 async def restore_product_embeds(
@@ -2028,7 +2211,7 @@ async def on_ready_handler(
         logging.error(f"❌ Failed to register persistent admin panel view: {e}")
 
     try:
-        if hasattr(bot_instance._http, '_global_over') and type(bot_instance._http._global_over).__name__ == '_MissingSentinel':
+        if hasattr(bot_instance, '_http') and hasattr(bot_instance._http, '_global_over') and type(bot_instance._http._global_over).__name__ == '_MissingSentinel':
             bot_instance._http._global_over = asyncio.Event()
             bot_instance._http._global_over.set()
             logging.info("✅ Patched bot._http._global_over event for HTTP client")

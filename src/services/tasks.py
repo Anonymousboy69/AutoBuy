@@ -6,8 +6,8 @@ from decimal import Decimal
 
 from discord.ext import tasks
 from shopbot.database import get_db, update_daily_sales_metrics, log_performance, create_database_backup, optimize_database, get_database_health
-from utils import DB_FILE, INVOICE_REFRESH_INTERVAL, POLL_INTERVAL, PAYMENT_TIMEOUT, get_payment_poll_interval
-from shopbot.crypto import get_address_balance, get_addresses_balance, litoshi_to_ltc, format_ltc
+from utils import DB_FILE, INVOICE_REFRESH_INTERVAL, POLL_INTERVAL, PAYMENT_TIMEOUT, get_payment_poll_interval, get_next_blockcypher_token
+from shopbot.crypto import get_address_balance, get_addresses_balance, litoshi_to_ltc, format_ltc, delete_blockcypher_webhook
 from src.services.payment_engine import process_automatic_refund
 from src.services.order_manager import update_invoice_message, update_user_order_message, refresh_pending_invoice_messages
 from src.services.stock_manager import update_stock_message, send_low_stock_alert, notify_next_in_queue
@@ -42,7 +42,7 @@ async def check_payments(
     """Poll for payment confirmations and process orders with adaptive rate limiting"""
     conn = get_db(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE status IN (?, ?, ?, ?, ?, ?) AND (swept_at IS NULL OR swept_at = '')", ('pending', 'paid', 'expired', 'canceled', 'failed', 'no_stock'))
+    c.execute("SELECT * FROM orders WHERE status = ? AND (swept_at IS NULL OR swept_at = '')", ('pending',))
     pending_orders = c.fetchall()
     conn.close()
 
@@ -50,7 +50,7 @@ async def check_payments(
         logging.debug("check_payments poll: no pending orders")
         return
 
-    logging.info(f"check_payments poll: {len(pending_orders)} pending/paid/expired/canceled/failed/no_stock orders")
+    logging.info(f"check_payments poll: {len(pending_orders)} pending orders")
 
     # Adaptive polling: if we have many orders, be more conservative with API calls
     adaptive_delay = min(30, len(pending_orders) // 10)  # Add up to 30s delay for every 10 orders
@@ -120,7 +120,17 @@ async def check_payments(
             if confirmed_balance >= expected_amount - tolerance:
                 logging.info(f"✅ Payment detected for order {oid[:8]}: {format_ltc(confirmed_balance)} LTC (expected: {format_ltc(expected_amount)} LTC)")
                 orders_with_payment.append((order_dict, balance_info))
-
+                if order_dict.get('blockcypher_hook_id'):
+                    try:
+                        deleted = await delete_blockcypher_webhook(order_dict['blockcypher_hook_id'], get_next_blockcypher_token())
+                        if deleted:
+                            cleanup_conn = get_db(DB_FILE)
+                            cleanup_cursor = cleanup_conn.cursor()
+                            cleanup_cursor.execute("UPDATE orders SET blockcypher_hook_id = NULL WHERE id = ?", (oid,))
+                            cleanup_conn.commit()
+                            cleanup_conn.close()
+                    except Exception as e:
+                        logging.warning(f"Failed to delete BlockCypher webhook for order {oid[:8]}: {e}")
                 conn = get_db(DB_FILE)
                 c = conn.cursor()
                 c.execute(
@@ -143,6 +153,19 @@ async def check_payments(
 
             elif order_dict['status'] == 'pending' and order_dict['created_at'] + PAYMENT_TIMEOUT < now:
                 logging.info(f"⏰ Order {oid[:8]} expired (no payment within {PAYMENT_TIMEOUT}s)")
+
+                if order_dict.get('blockcypher_hook_id'):
+                    try:
+                        deleted = await delete_blockcypher_webhook(order_dict['blockcypher_hook_id'], get_next_blockcypher_token())
+                        if deleted:
+                            cleanup_conn = get_db(DB_FILE)
+                            cleanup_cursor = cleanup_conn.cursor()
+                            cleanup_cursor.execute("UPDATE orders SET blockcypher_hook_id = NULL WHERE id = ?", (oid,))
+                            cleanup_conn.commit()
+                            cleanup_conn.close()
+                    except Exception as e:
+                        logging.warning(f"Failed to delete BlockCypher webhook for expired order {oid[:8]}: {e}")
+
                 conn = get_db(DB_FILE)
                 c = conn.cursor()
                 c.execute("UPDATE orders SET status = 'expired' WHERE id = ?", (oid,))
@@ -175,6 +198,7 @@ async def check_payments(
 
 
 async def handle_blockcypher_webhook_event(
+    order_id: str,
     address: str,
     bot_instance,
     update_invoice_callback,
@@ -185,23 +209,29 @@ async def handle_blockcypher_webhook_event(
     get_reserved_stock_items_for_order_callback,
     build_seller_payout_outputs_callback,
 ) -> bool:
-    """Handle incoming BlockCypher webhook events for an address."""
+    """Handle incoming BlockCypher webhook events for a single order."""
     conn = get_db(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "SELECT * FROM orders WHERE ltc_address = ? AND status IN (?, ?, ?) AND (swept_at IS NULL OR swept_at = '')",
-        (address, 'pending', 'paid', 'canceled')
+        "SELECT * FROM orders WHERE id = ? AND status IN (?, ?, ?) AND (swept_at IS NULL OR swept_at = '')",
+        (order_id, 'pending', 'paid', 'canceled')
     )
-    rows = c.fetchall()
+    row = c.fetchone()
     conn.close()
 
-    if not rows:
-        logging.info(f"Webhook event for {address} did not match any active orders")
+    if not row:
+        logging.info(f"Webhook event for order {order_id} did not match any active orders")
         return False
 
-    balance_info = await get_address_balance(address)
+    order_dict = dict(row)
+    if address and order_dict.get('ltc_address') != address:
+        logging.warning(
+            f"Webhook order {order_id} address mismatch: expected {order_dict.get('ltc_address')} got {address}"
+        )
+
+    balance_info = await get_address_balance(order_dict.get('ltc_address'))
     if not balance_info:
-        logging.warning(f"Webhook event for {address} could not fetch balance")
+        logging.warning(f"Webhook event for order {order_id} could not fetch balance")
         return False
 
     confirmed_balance = litoshi_to_ltc_callback(balance_info.get('balance', 0))
@@ -209,35 +239,50 @@ async def handle_blockcypher_webhook_event(
     now = datetime.now(timezone.utc).timestamp()
     processed = False
     delivery_candidates: list[tuple[dict, dict]] = []
+    oid = order_dict['id']
+    expected_amount = Decimal(str(order_dict['price_ltc']))
+    tolerance = Decimal('0.00000001') * 2
 
-    for row in rows:
-        order_dict = dict(row)
-        oid = order_dict['id']
-        expected_amount = Decimal(str(order_dict['price_ltc']))
-        tolerance = Decimal('0.00000001') * 2
+    async def _cleanup_hook() -> None:
+        if not order_dict.get('blockcypher_hook_id'):
+            return
+        try:
+            deleted = await delete_blockcypher_webhook(order_dict['blockcypher_hook_id'], get_next_blockcypher_token())
+            if deleted:
+                cleanup_conn = get_db(DB_FILE)
+                cleanup_cursor = cleanup_conn.cursor()
+                cleanup_cursor.execute("UPDATE orders SET blockcypher_hook_id = NULL WHERE id = ?", (oid,))
+                cleanup_conn.commit()
+                cleanup_conn.close()
+        except Exception as e:
+            logging.warning(f"Failed to delete BlockCypher webhook for order {oid[:8]}: {e}")
 
-        if order_dict['status'] == 'pending' and confirmed_balance >= expected_amount - tolerance:
-            logging.info(f"Webhook payment detected for order {oid[:8]} at {address}")
-            conn = get_db(DB_FILE)
-            c = conn.cursor()
-            c.execute(
-                "UPDATE orders SET status = 'paid', paid_at = ?, payment_detected_at = ? WHERE id = ?",
-                (now, now, oid)
-            )
-            conn.commit()
-            conn.close()
-            await update_invoice_callback(order_dict, balance_info)
-            delivery_candidates.append((order_dict, balance_info))
-            processed = True
+    if order_dict['status'] == 'pending' and confirmed_balance >= expected_amount - tolerance:
+        logging.info(f"Webhook payment detected for order {oid[:8]} at {address}")
+        await _cleanup_hook()
+        conn = get_db(DB_FILE)
+        c = conn.cursor()
+        c.execute(
+            "UPDATE orders SET status = 'paid', paid_at = ?, payment_detected_at = ? WHERE id = ?",
+            (now, now, oid)
+        )
+        conn.commit()
+        conn.close()
+        order_dict['status'] = 'paid'
+        await update_invoice_callback(order_dict, balance_info)
+        delivery_candidates.append((order_dict, balance_info))
+        processed = True
 
-        elif order_dict['status'] == 'paid':
-            delivery_candidates.append((order_dict, balance_info))
-            processed = True
+    elif order_dict['status'] == 'paid':
+        await _cleanup_hook()
+        delivery_candidates.append((order_dict, balance_info))
+        processed = True
 
-        elif order_dict['status'] == 'canceled' and (confirmed_balance > 0 or unconfirmed_balance > 0):
-            logging.info(f"Webhook refund triggered for canceled order {oid[:8]} at {address}")
-            await process_automatic_refund_callback(order_dict, balance_info, bot_instance)
-            processed = True
+    elif order_dict['status'] == 'canceled' and (confirmed_balance > 0 or unconfirmed_balance > 0):
+        await _cleanup_hook()
+        logging.info(f"Webhook refund triggered for canceled order {oid[:8]} at {address}")
+        await process_automatic_refund_callback(order_dict, balance_info, bot_instance)
+        processed = True
 
     for order_dict, balance_info in delivery_candidates:
         try:
