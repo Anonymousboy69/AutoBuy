@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+import os
 from shopbot.database import get_db
 
+DB_FILE = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'shop_data.db'))
+
 def check_db():
-    conn = get_db('shop.db')
+    conn = get_db(DB_FILE)
     c = conn.cursor()
 
     # Check delivered orders

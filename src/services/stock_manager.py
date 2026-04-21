@@ -5,10 +5,11 @@ import discord
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from shopbot.database import get_db, get_product, get_order, reserve_stock_items
+from shopbot.database import get_db, get_product, get_order
 from shopbot.shop import get_stock_status
 from utils import DB_FILE, ADMIN_ROLE_ID, LOW_STOCK_THRESHOLD, COLORS
 from ui.views import ProductDetailView
+from src.http_utils import ensure_http_client_ready
 
 
 async def update_stock_message(product_id: str, bot_instance):
@@ -20,6 +21,18 @@ async def update_stock_message(product_id: str, bot_instance):
     embed_msg_id = product.get("embed_msg_id")
     if not channel_id or not embed_msg_id:
         return
+
+    def clear_stale_embed():
+        try:
+            conn = get_db(DB_FILE)
+            c = conn.cursor()
+            c.execute("UPDATE products SET channel_id = NULL, embed_msg_id = NULL WHERE id = ?", (product_id,))
+            conn.commit()
+            conn.close()
+            logging.info(f"Cleared stale embed reference for product {product_id}")
+        except Exception as clear_error:
+            logging.debug(f"Could not clear stale embed reference for product {product_id}: {clear_error}")
+
     try:
         channel = bot_instance.get_channel(int(channel_id))
         if channel is None:
@@ -28,10 +41,21 @@ async def update_stock_message(product_id: str, bot_instance):
                 if channel:
                     break
         if channel is None:
-            logging.warning(f"⏳ Stock embed channel {channel_id} not in cache; cannot fetch because fetch_channel is unstable in this environment")
+            try:
+                await ensure_http_client_ready(bot_instance)
+                channel = await bot_instance.fetch_channel(int(channel_id))
+            except Exception as e:
+                logging.warning(f"⏳ Stock embed channel {channel_id} not in cache and fetch_channel failed: {e}")
+                clear_stale_embed()
+                return
+        if channel is None:
+            logging.warning(f"⏳ Stock embed channel {channel_id} not found")
+            clear_stale_embed()
             return
         msg = await channel.fetch_message(int(embed_msg_id))
         if not msg.embeds:
+            logging.warning(f"⏳ Stock embed message {embed_msg_id} for product {product_id} has no embeds")
+            clear_stale_embed()
             return
         em = msg.embeds[0].copy()
         stock_count, stock_emoji = get_stock_status(DB_FILE, product_id)
@@ -116,10 +140,8 @@ async def notify_next_in_queue(product_id: str, bot_instance, get_channel_callba
             break
 
         order_id, user_id, channel_id, message_id, quantity = queued_order
-        reserved_items = reserve_stock_items(product_id, int(quantity), order_id)
-        if len(reserved_items) != int(quantity):
-            logging.info(f"Queued order {order_id[:8]} still waiting for stock")
-            break
+        # No longer reserve stock - just notify user that stock is available
+        # Stock will be assigned when payment is received (first pay wins)
 
         try:
             user = await bot_instance.fetch_user(int(user_id))

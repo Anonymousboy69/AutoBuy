@@ -16,8 +16,6 @@ from shopbot.database import (
     get_user_wallet as _get_user_wallet, set_user_wallet as _set_user_wallet,
     remove_user_wallet as _remove_user_wallet, get_seller_revenue as _get_seller_revenue,
     record_payout as _record_payout, get_payout_history as _get_payout_history,
-    reserve_stock_items as _reserve_stock_items, release_reserved_stock as _release_reserved_stock,
-    get_reserved_stock_items_for_order as _get_reserved_stock_items_for_order,
     build_seller_payout_from_pending_stock as _build_seller_payout_from_pending_stock,
     assign_order_stock_to_order as _assign_order_stock_to_order, get_db
 )
@@ -96,18 +94,6 @@ def normalize_product_id(product_id: str) -> str:
     return product_id
 
 
-def reserve_stock_items(product_id: str, quantity: int, order_id: str) -> List[dict]:
-    return _reserve_stock_items(DB_FILE, product_id, quantity, order_id)
-
-
-def release_reserved_stock(order_id: str) -> int:
-    return _release_reserved_stock(DB_FILE, order_id)
-
-
-def get_reserved_stock_items_for_order(order_id: str) -> List[dict]:
-    return _get_reserved_stock_items_for_order(DB_FILE, order_id)
-
-
 def get_user_wallet(user_id: str) -> Optional[dict]:
     return _get_user_wallet(DB_FILE, user_id)
 
@@ -142,12 +128,24 @@ def assign_order_stock_to_order(order: dict) -> bool:
 
 def build_seller_payout_outputs(order: dict) -> tuple[list[tuple[str, Decimal]] | None, str | None]:
     quantity = int(order.get('quantity', 1))
-    reserved_items = get_reserved_stock_items_for_order(order['id'])
-    if not reserved_items:
-        return None, "No reserved stock items assigned to this order."
+    # Get delivered items instead of reserved items (reservations removed)
+    conn = get_db(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        SELECT si.*, uw.ltc_address
+        FROM stock_items si
+        LEFT JOIN user_wallets uw ON si.restocked_by = uw.user_id AND uw.is_active = 1
+        WHERE si.order_id = ? AND si.status = 'delivered'
+        ORDER BY si.created_at ASC
+    ''', (order['id'],))
+    delivered_items = [dict(row) for row in c.fetchall()]
+    conn.close()
 
-    if len(reserved_items) != quantity:
-        return None, "Reserved stock quantity mismatch for this order. Please verify stock allocation."
+    if not delivered_items:
+        return None, "No delivered stock items assigned to this order."
+
+    if len(delivered_items) != quantity:
+        return None, "Delivered stock quantity mismatch for this order. Please verify stock allocation."
 
     price_per_item = Decimal(str(order['price_ltc'])) / Decimal(str(quantity))
     recipients: dict[str, Decimal] = {}

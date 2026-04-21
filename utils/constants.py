@@ -7,7 +7,7 @@ import discord
 from discord.ext import commands
 from datetime import datetime, timezone
 from decimal import Decimal
-from .config import CONFIG, ADMIN_ROLE_ID, SELLER_ROLE_ID
+from .config import CONFIG, ADMIN_ROLE_ID, SELLER_ROLE_ID, OWNER_ID
 
 # ─────────────────────────────────────────────
 #  CONSTANTS
@@ -21,22 +21,37 @@ COLORS = {
 }
 
 STATUS_EMOJI = {
-    "pending":  "⏳",
-    "paid":     "✅",
-    "expired":  "⏰",
-    "delivered": "🎁",
-    "failed":   "❌",
+    "pending":     "⏳",
+    "queued":      "⏳",
+    "paid":        "✅",
+    "delivered":   "🎁",
+    "expired":     "⏰",
+    "canceled":    "❌",
+    "refunded":    "💸",
+    "failed":      "❌",
+    "sweep_failed": "⚠️",
+}
+
+ORDER_STATUS_LABELS = {
+    "pending":      "Pending payment",
+    "queued":       "Queued for stock",
+    "paid":         "Paid",
+    "delivered":    "Delivered",
+    "expired":      "Expired",
+    "canceled":     "Canceled",
+    "refunded":     "Refunded",
+    "failed":       "Delivery failed",
+    "sweep_failed": "Sweep failed",
 }
 
 PAYMENT_TIMEOUT   = CONFIG["crypto"]["payment_timeout"]
-RESERVATION_TIMEOUT = CONFIG["crypto"]["reservation_timeout"]
 POLL_INTERVAL     = CONFIG["crypto"]["poll_interval"]
-INVOICE_REFRESH_INTERVAL = CONFIG["crypto"].get("invoice_refresh_interval", 60)
+INVOICE_REFRESH_INTERVAL = CONFIG["crypto"].get("invoice_refresh_interval", 5)  # Fast refresh for real-time accuracy
 LTC_CONFIRMATIONS = CONFIG["crypto"]["ltc_confirmations"]
 RESTOCK_RATE_LIMIT = CONFIG["shop"]["restock_rate_limit"]
 LOW_STOCK_THRESHOLD = CONFIG["shop"]["low_stock_threshold"]
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8080"))
+WEBHOOK_PORT = int(os.getenv("WEBHOOK_PORT", "8081"))
 WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 BLOCKCYPHER_WEBHOOK_EVENT = os.getenv("BLOCKCYPHER_WEBHOOK_EVENT", "tx-confirmation").strip()
@@ -115,6 +130,13 @@ def user_has_admin_or_seller_role(member: discord.Member) -> bool:
         return True
     return any(r.id == ADMIN_ROLE_ID or r.id == SELLER_ROLE_ID for r in member.roles)
 
+def owner_check_interaction(interaction: discord.Interaction) -> bool:
+    # Check config-defined owner first
+    if OWNER_ID is not None:
+        return str(interaction.user.id) == str(OWNER_ID)
+    # Fallback to server owner
+    return interaction.guild and interaction.guild.owner_id == interaction.user.id
+
 def admin_check_interaction(interaction: discord.Interaction) -> bool:
     if interaction.guild and interaction.guild.owner_id == interaction.user.id:
         return True
@@ -128,11 +150,29 @@ def seller_check_interaction(interaction: discord.Interaction) -> bool:
 def admin_or_seller_check_interaction(interaction: discord.Interaction) -> bool:
     return admin_check_interaction(interaction) or seller_check_interaction(interaction)
 
+def owner_or_admin_check_interaction(interaction: discord.Interaction) -> bool:
+    """Check if user is owner OR admin (gives both full bot access except /reset)"""
+    return owner_check_interaction(interaction) or admin_check_interaction(interaction)
+
 def is_admin():
     async def predicate(ctx):
         member = ctx.author
         guild  = ctx.guild
         if guild and guild.owner_id == member.id:
             return True
+        return any(r.id == ADMIN_ROLE_ID for r in member.roles)
+    return commands.check(predicate)
+
+def is_owner_or_admin():
+    async def predicate(ctx):
+        member = ctx.author
+        guild = ctx.guild
+        # Check configurable owner first
+        if OWNER_ID is not None:
+            return str(member.id) == str(OWNER_ID)
+        # Fallback to server owner
+        if guild and guild.owner_id == member.id:
+            return True
+        # Check admin role
         return any(r.id == ADMIN_ROLE_ID for r in member.roles)
     return commands.check(predicate)

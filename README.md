@@ -217,11 +217,11 @@ DM user delivery content
 
 ### **Payment Flow Details**
 
-1. **Order Creation:** Generates unique address, reserves stock, posts invoice
+1. **Order Creation:** Generates unique address, posts invoice (stock assigned on payment)
 2. **Payment Detection:** Webhook (real-time) or polling (every 5min with adaptive delays)
 3. **Confirmation Waiting:** Waits for 1 LTC confirmation (configurable)
 4. **Sweep:** Transfers payment from order address to platform wallet
-5. **Stock Delivery:** Assigns reserved stock items to order
+5. **Stock Delivery:** Assigns available stock items to paid order (first pay wins)
 6. **User Notification:** DMs user with delivery content + transaction ID
 7. **Seller Payout:** (Optional) Sweeps seller's portion to their linked wallet
 
@@ -234,7 +234,8 @@ DM user delivery content
     "payment_timeout": 3600,               // Order expires in 1 hour
     "ltc_confirmations": 1,               // Require 1 confirmation
     "poll_interval": 300,                 // Poll every 5 minutes
-    "reservation_timeout": 300            // Stock reserved 5 mins
+    "webhook_primary": true,              // Use webhooks for faster payment detection
+    "webhook_required": false             // Fall back to polling if webhooks fail
   }
 }
 ```
@@ -305,18 +306,14 @@ DM user delivery content
 **Stock Item States:**
 - `pending` - Available for purchase
 - `staging` - Being added (in restock form)
-- `reserved` - Allocated to specific order
 - `delivered` - Sent to customer
 
 **Key Functions:**
 
-1. **`reserve_stock_items()`**
-   - Atomic transaction: SELECT + UPDATE in single transaction
-   - Prevents double-selling
-   - Returns reserved items or fails if insufficient stock
-
-2. **`assign_order_stock_to_order()`**
-   - Matches pending stock to paid order
+1. **`assign_order_stock_to_order()`**
+   - **First Pay Wins**: Atomic transaction assigns pending stock to paid orders
+   - No reservations - stock is assigned when payment is confirmed
+   - Prevents double-selling through database locking
    - Creates seller payout records
    - Marks items as delivered
    - Updates delivery timestamps
@@ -440,7 +437,8 @@ DM user delivery content
     "payment_timeout": 3600,
     "ltc_confirmations": 1,
     "poll_interval": 300,
-    "reservation_timeout": 300
+    "webhook_primary": true,
+    "webhook_required": false
   },
   "database": {
     "file": "data/shop_data.db"
@@ -647,11 +645,10 @@ Command Handler checks:
   - Has stock (pending items)
   - User role permissions
   ↓
-reserve_stock_items() → Atomic DB transaction:
-  - Locks stock_items table
-  - Finds N pending items for product_id
-  - Updates status to 'reserved'
-  - Assigns to new order_id
+Order Creation → Creates order record:
+  - Generates unique order_id
+  - Sets status to 'pending'
+  - No stock reservation (first pay wins)
   ↓
 generate_ltc_address() → Derives unique address:
   - Gets next address_index from DB
@@ -858,8 +855,8 @@ Seller receives payment on-chain
    - Parallel webhook and polling payment detection
 
 3. **Database Transactions:**
-   - Stock reservation uses `BEGIN IMMEDIATE` for atomicity
-   - Prevents race conditions in concurrent orders
+   - Stock assignment uses `BEGIN IMMEDIATE` for atomicity
+   - Prevents race conditions in concurrent payments
 
 4. **Rate Limiting:**
    - User action throttling (restock limits)

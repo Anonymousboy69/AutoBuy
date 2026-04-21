@@ -5,7 +5,7 @@ import time
 import shutil
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 from functools import wraps
 
 # ─────────────────────────────────────────────
@@ -244,6 +244,8 @@ def init_db(db_file: str):
         'ALTER TABLE orders ADD COLUMN refund_attempts INTEGER DEFAULT 0',
         'ALTER TABLE orders ADD COLUMN blockcypher_hook_id TEXT',
         'ALTER TABLE orders ADD COLUMN quantity INTEGER DEFAULT 1',
+        'ALTER TABLE orders ADD COLUMN payment_txid TEXT',
+        'ALTER TABLE orders ADD COLUMN payment_confirmations INTEGER DEFAULT 0',
         'ALTER TABLE stock_items ADD COLUMN restocked_by TEXT',
         'ALTER TABLE stock_items ADD COLUMN order_id TEXT',
         'ALTER TABLE stock_items ADD COLUMN message_channel_id INTEGER',
@@ -417,56 +419,6 @@ def get_stock_items(db_file: str, product_id: str, status: str = None) -> List[d
                   (product_id, status))
     else:
         c.execute('SELECT * FROM stock_items WHERE product_id = ? ORDER BY created_at ASC', (product_id,))
-    rows = c.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
-
-
-def reserve_stock_items(db_file: str, product_id: str, quantity: int, order_id: str) -> List[dict]:
-    conn = get_db(db_file)
-    c = conn.cursor()
-    conn.execute('BEGIN IMMEDIATE')
-    c.execute('SELECT id FROM stock_items WHERE product_id = ? AND status = ? ORDER BY created_at ASC LIMIT ?',
-              (product_id, 'pending', quantity))
-    rows = c.fetchall()
-    if len(rows) < quantity:
-        conn.rollback()
-        conn.close()
-        return []
-
-    item_ids = [row['id'] for row in rows]
-    c.executemany('UPDATE stock_items SET status = ?, order_id = ? WHERE id = ?',
-                  [('reserved', order_id, item_id) for item_id in item_ids])
-    conn.commit()
-
-    c.execute('SELECT * FROM stock_items WHERE order_id = ? ORDER BY created_at ASC', (order_id,))
-    reserved_rows = c.fetchall()
-    conn.close()
-    return [dict(row) for row in reserved_rows]
-
-
-def release_reserved_stock(db_file: str, order_id: str) -> int:
-    conn = get_db(db_file)
-    c = conn.cursor()
-    conn.execute('BEGIN IMMEDIATE')
-    c.execute('UPDATE stock_items SET status = ?, order_id = NULL WHERE order_id = ? AND status = ?',
-              ('pending', order_id, 'reserved'))
-    released = c.rowcount
-    conn.commit()
-    conn.close()
-    return released
-
-
-def get_reserved_stock_items_for_order(db_file: str, order_id: str) -> List[dict]:
-    conn = get_db(db_file)
-    c = conn.cursor()
-    c.execute('''
-        SELECT si.*, uw.ltc_address
-        FROM stock_items si
-        LEFT JOIN user_wallets uw ON si.restocked_by = uw.user_id AND uw.is_active = 1
-        WHERE si.order_id = ? AND si.status IN ('reserved', 'delivered')
-        ORDER BY si.created_at ASC
-    ''', (order_id,))
     rows = c.fetchall()
     conn.close()
     return [dict(row) for row in rows]
@@ -948,3 +900,186 @@ def optimize_database(db_file: str):
     except Exception as e:
         logging.error(f"Database optimization failed: {e}")
         return False
+
+
+# ─────────────────────────────────────────────
+#  DATABASE INTEGRITY CHECKS
+# ─────────────────────────────────────────────
+def check_database_integrity(db_file: str) -> Dict[str, Any]:
+    """
+    Check database integrity and return a report of any issues found.
+    Also provides options to automatically fix common issues.
+    """
+    issues = []
+    fixes_applied = []
+
+    try:
+        conn = get_db(db_file)
+        c = conn.cursor()
+
+        # Check for orphaned stock items (stock items without products)
+        c.execute('''
+            SELECT si.id, si.product_id, p.id as product_exists
+            FROM stock_items si
+            LEFT JOIN products p ON si.product_id = p.id
+            WHERE p.id IS NULL
+        ''')
+        orphaned_stock = c.fetchall()
+
+        if orphaned_stock:
+            issues.append(f"Found {len(orphaned_stock)} orphaned stock items")
+            logging.warning(f"Database integrity: {len(orphaned_stock)} stock items reference non-existent products")
+
+            # Auto-fix: delete orphaned stock items
+            orphaned_ids = [row['id'] for row in orphaned_stock]
+            if orphaned_ids:
+                c.execute(f"DELETE FROM stock_items WHERE id IN ({','.join('?' * len(orphaned_ids))})", orphaned_ids)
+                fixes_applied.append(f"Deleted {len(orphaned_ids)} orphaned stock items")
+                logging.info(f"Auto-fixed: deleted {len(orphaned_ids)} orphaned stock items")
+
+        # Check for orphaned orders (orders without products)
+        c.execute('''
+            SELECT o.id, o.product_id, p.id as product_exists
+            FROM orders o
+            LEFT JOIN products p ON o.product_id = p.id
+            WHERE p.id IS NULL
+        ''')
+        orphaned_orders = c.fetchall()
+
+        if orphaned_orders:
+            issues.append(f"Found {len(orphaned_orders)} orders referencing non-existent products")
+            logging.warning(f"Database integrity: {len(orphaned_orders)} orders reference non-existent products")
+
+            # For orders, we mark them as failed rather than deleting
+            orphaned_order_ids = [row['id'] for row in orphaned_orders]
+            if orphaned_order_ids:
+                c.execute(f"UPDATE orders SET status = 'failed', error_message = 'Product no longer exists' WHERE id IN ({','.join('?' * len(orphaned_order_ids))})", orphaned_order_ids)
+                fixes_applied.append(f"Marked {len(orphaned_order_ids)} orphaned orders as failed")
+                logging.info(f"Auto-fixed: marked {len(orphaned_order_ids)} orphaned orders as failed")
+
+        # Check for orphaned audit logs (audit logs without products)
+        c.execute('''
+            SELECT al.id, al.product_id, p.id as product_exists
+            FROM audit_log al
+            LEFT JOIN products p ON al.product_id = p.id
+            WHERE p.id IS NULL
+        ''')
+        orphaned_audit = c.fetchall()
+
+        if orphaned_audit:
+            issues.append(f"Found {len(orphaned_audit)} audit log entries referencing non-existent products")
+            logging.warning(f"Database integrity: {len(orphaned_audit)} audit entries reference non-existent products")
+
+            # Auto-fix: delete orphaned audit entries
+            orphaned_audit_ids = [row['id'] for row in orphaned_audit]
+            if orphaned_audit_ids:
+                c.execute(f"DELETE FROM audit_log WHERE id IN ({','.join('?' * len(orphaned_audit_ids))})", orphaned_audit_ids)
+                fixes_applied.append(f"Deleted {len(orphaned_audit_ids)} orphaned audit log entries")
+                logging.info(f"Auto-fixed: deleted {len(orphaned_audit_ids)} orphaned audit entries")
+
+        # Check for reserved stock items that are not assigned to any order (deprecated - reservations removed)
+        c.execute('''
+            SELECT si.id, si.order_id
+            FROM stock_items si
+            WHERE si.status = 'reserved' AND (si.order_id IS NULL OR si.order_id = '')
+        ''')
+        invalid_reserved = c.fetchall()
+
+        if invalid_reserved:
+            issues.append(f"Found {len(invalid_reserved)} stock items with deprecated 'reserved' status (reservations no longer used)")
+            logging.warning(f"Database integrity: {len(invalid_reserved)} stock items have deprecated reservation status")
+
+            # Auto-fix: reset to pending (reservations no longer used)
+            invalid_ids = [row['id'] for row in invalid_reserved]
+            if invalid_ids:
+                c.execute(f"UPDATE stock_items SET status = 'pending', order_id = NULL WHERE id IN ({','.join('?' * len(invalid_ids))})", invalid_ids)
+                fixes_applied.append(f"Reset {len(invalid_ids)} invalid reservations to pending")
+                logging.info(f"Auto-fixed: reset {len(invalid_ids)} invalid reservations")
+
+        # Check for orders with invalid status transitions
+        c.execute('''
+            SELECT id, status, paid_at, swept_at
+            FROM orders
+            WHERE status = 'paid' AND paid_at IS NOT NULL AND swept_at IS NULL
+        ''')
+        stuck_paid_orders = c.fetchall()
+
+        if stuck_paid_orders:
+            issues.append(f"Found {len(stuck_paid_orders)} orders stuck in 'paid' status (paid but not swept)")
+            logging.warning(f"Database integrity: {len(stuck_paid_orders)} orders are stuck in paid status")
+
+            # Don't auto-fix this as it requires manual intervention
+            # Just report it
+
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        issues.append(f"Error during integrity check: {e}")
+        logging.error(f"Database integrity check failed: {e}")
+
+    return {
+        'issues_found': len(issues),
+        'issues': issues,
+        'fixes_applied': fixes_applied,
+        'timestamp': datetime.now(timezone.utc).timestamp()
+    }
+
+
+def cleanup_database(db_file: str) -> Dict[str, Any]:
+    """
+    Run database cleanup operations:
+    - Vacuum database to reclaim space
+    - Rebuild indexes
+    - Analyze tables for query optimization
+    """
+    try:
+        conn = get_db(db_file)
+        c = conn.cursor()
+
+        # Get database size before cleanup
+        c.execute("PRAGMA page_count")
+        pages_before = c.fetchone()[0]
+        c.execute("PRAGMA page_size")
+        page_size = c.fetchone()[0]
+        size_before = pages_before * page_size
+
+        # Run integrity check first
+        c.execute("PRAGMA integrity_check")
+        integrity_result = c.fetchone()[0]
+
+        if integrity_result != "ok":
+            logging.error(f"Database integrity check failed: {integrity_result}")
+            conn.close()
+            return {'success': False, 'error': f'Integrity check failed: {integrity_result}'}
+
+        # Vacuum database
+        conn.close()  # Close connection before vacuum
+        conn = sqlite3.connect(db_file)
+        conn.execute("VACUUM")
+        conn.close()
+
+        # Reconnect and analyze
+        conn = get_db(db_file)
+        c = conn.cursor()
+        c.execute("ANALYZE")
+
+        # Get database size after cleanup
+        c.execute("PRAGMA page_count")
+        pages_after = c.fetchone()[0]
+        size_after = pages_after * page_size
+
+        space_saved = size_before - size_after
+
+        conn.close()
+
+        return {
+            'success': True,
+            'space_saved_bytes': space_saved,
+            'size_before': size_before,
+            'size_after': size_after
+        }
+
+    except Exception as e:
+        logging.error(f"Database cleanup failed: {e}")
+        return {'success': False, 'error': str(e)}

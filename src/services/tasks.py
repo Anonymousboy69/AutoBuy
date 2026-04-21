@@ -7,12 +7,25 @@ from decimal import Decimal
 from discord.ext import tasks
 from shopbot.database import get_db, update_daily_sales_metrics, log_performance, create_database_backup, optimize_database, get_database_health
 from utils import DB_FILE, INVOICE_REFRESH_INTERVAL, POLL_INTERVAL, PAYMENT_TIMEOUT, get_payment_poll_interval, get_next_blockcypher_token
-from shopbot.crypto import get_address_balance, get_addresses_balance, litoshi_to_ltc, format_ltc, delete_blockcypher_webhook
+from shopbot.crypto import get_address_balance, get_addresses_balance, litoshi_to_ltc, format_ltc, delete_blockcypher_webhook, validate_transaction_safety, check_transaction_uniqueness, validate_address_ownership
 from src.services.payment_engine import process_automatic_refund
 from src.services.order_manager import update_invoice_message, update_user_order_message, refresh_pending_invoice_messages
 from src.services.stock_manager import update_stock_message, send_low_stock_alert, notify_next_in_queue
 from ui.embeds import build_live_embed
 from ui.views import ProductDetailView, AdminPanelView
+
+
+async def retry_api_call(func, *args, max_retries=3, delay=1.0, **kwargs):
+    """Retry an API call with exponential backoff"""
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            wait_time = delay * (2 ** attempt)
+            logging.warning(f"API call failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...")
+            await asyncio.sleep(wait_time)
 
 
 @tasks.loop(seconds=INVOICE_REFRESH_INTERVAL)
@@ -36,8 +49,7 @@ async def refresh_invoice_timers(all_orders_callback, refresh_invoice_callback, 
 async def check_payments(
     all_orders_callback, get_address_balance_callback, get_addresses_balance_callback, litoshi_to_ltc_callback,
     update_invoice_callback, process_automatic_refund_callback, process_payment_delivery_callback,
-    release_reserved_stock_callback, send_log_embed_callback, get_reserved_stock_items_for_order_callback,
-    build_seller_payout_outputs_callback, bot_instance
+    send_log_embed_callback, build_seller_payout_outputs_callback, notify_next_callback, bot_instance
 ):
     """Poll for payment confirmations and process orders with adaptive rate limiting"""
     conn = get_db(DB_FILE)
@@ -97,10 +109,10 @@ async def check_payments(
             logging.debug(f"Checking payment for order {oid[:8]}...")
             balance_info = balance_results.get(address) if address else None
             if not balance_info:
-                balance_info = await get_address_balance_callback(address) if address else None
+                balance_info = await retry_api_call(get_address_balance_callback, address) if address else None
 
             if not balance_info:
-                logging.warning(f"Failed to get balance for order {oid[:8]}")
+                logging.warning(f"Failed to get balance for order {oid[:8]} after retries")
                 continue
 
             checked_count += 1
@@ -118,7 +130,82 @@ async def check_payments(
             tolerance = Decimal('0.00000001') * 2
 
             if confirmed_balance >= expected_amount - tolerance:
-                logging.info(f"✅ Payment detected for order {oid[:8]}: {format_ltc(confirmed_balance)} LTC (expected: {format_ltc(expected_amount)} LTC)")
+                # TRANSACTION SAFETY VALIDATION - Critical for real money
+                address = order_dict.get('ltc_address')
+                if not address:
+                    logging.error(f"No LTC address for order {oid[:8]}, skipping payment detection")
+                    continue
+
+                # Validate address ownership (ensure it belongs to our wallet)
+                from utils import WALLET_SEED
+                if WALLET_SEED:
+                    address_valid = await validate_address_ownership(address, WALLET_SEED)
+                    if not address_valid:
+                        logging.error(f"Address {address} does not belong to our wallet for order {oid[:8]}")
+                        continue
+
+                # Store transaction details for later use
+                payment_txid = None
+                payment_confirmations = 0
+
+                # Get transaction details to validate safety
+                try:
+                    # Get recent transactions for this address
+                    from shopbot.crypto import get_address_transactions
+                    transactions = await get_address_transactions(address)
+
+                    # Find the transaction that brought the balance to the expected amount
+                    payment_tx = None
+                    for tx in transactions:
+                        if tx.get('value', 0) > 0:  # Incoming transaction
+                            tx_value_ltc = litoshi_to_ltc_callback(tx.get('value', 0))
+                            if abs(tx_value_ltc - expected_amount) <= tolerance:
+                                payment_tx = tx
+                                break
+
+                    if payment_tx:
+                        txid = payment_tx.get('tx_hash')
+                        if txid:
+                            payment_txid = txid
+                            # Validate transaction safety
+                            validation_result = await validate_transaction_safety(
+                                txid=txid,
+                                expected_address=address,
+                                expected_amount_ltc=expected_amount,
+                                blockcypher_token=get_next_blockcypher_token(),
+                                min_confirmations=1  # Require at least 1 confirmation
+                            )
+
+                            if not validation_result['valid']:
+                                logging.warning(f"Transaction validation failed for order {oid[:8]}: {', '.join(validation_result['errors'])}")
+                                if validation_result['warnings']:
+                                    logging.warning(f"Transaction warnings for order {oid[:8]}: {', '.join(validation_result['warnings'])}")
+                                continue
+
+                            payment_confirmations = validation_result['confirmations']
+
+                            # Check transaction uniqueness (prevent double-processing)
+                            tx_unique = await check_transaction_uniqueness(txid, DB_FILE)
+                            if not tx_unique:
+                                logging.warning(f"Transaction {txid} already processed, skipping order {oid[:8]}")
+                                continue
+
+                            logging.info(f"✅ Transaction validation passed for order {oid[:8]}: {txid} ({validation_result['confirmations']} confirmations)")
+
+                except Exception as e:
+                    logging.error(f"Transaction validation error for order {oid[:8]}: {e}")
+                    continue
+
+                # Validate payment amount is not excessively over the expected amount
+                overpayment_threshold = expected_amount * Decimal('1.1')  # 10% overpayment threshold
+                if confirmed_balance > overpayment_threshold:
+                    logging.warning(f"⚠️ Overpayment detected for order {oid[:8]}: {format_ltc(confirmed_balance)} LTC (expected: {format_ltc(expected_amount)} LTC)")
+                    # Still process but log the overpayment
+                elif confirmed_balance < expected_amount - tolerance:
+                    logging.debug(f"Payment incomplete for order {oid[:8]}: {format_ltc(confirmed_balance)} LTC (expected: {format_ltc(expected_amount)} LTC)")
+                    continue
+
+                logging.info(f"✅ Payment detected and validated for order {oid[:8]}: {format_ltc(confirmed_balance)} LTC (expected: {format_ltc(expected_amount)} LTC)")
                 orders_with_payment.append((order_dict, balance_info))
                 if order_dict.get('blockcypher_hook_id'):
                     try:
@@ -134,8 +221,8 @@ async def check_payments(
                 conn = get_db(DB_FILE)
                 c = conn.cursor()
                 c.execute(
-                    "UPDATE orders SET status = 'paid', paid_at = ?, payment_detected_at = ? WHERE id = ?",
-                    (now, now, oid)
+                    "UPDATE orders SET status = 'paid', paid_at = ?, payment_detected_at = ?, payment_txid = ?, payment_confirmations = ? WHERE id = ?",
+                    (now, now, payment_txid, payment_confirmations, oid)
                 )
                 conn.commit()
                 conn.close()
@@ -173,14 +260,20 @@ async def check_payments(
                 conn.close()
 
                 await update_invoice_callback(order_dict, balance_info)
-                release_reserved_stock_callback(oid)
-                await notify_next_in_queue(order_dict['product_id'])
+                await notify_next_callback(order_dict['product_id'])
 
             elif order_dict['status'] == 'canceled' and (confirmed_balance > 0 or unconfirmed_balance > 0):
                 await process_automatic_refund_callback(order_dict, balance_info, bot_instance)
 
+            elif order_dict['status'] == 'pending' and (confirmed_balance > 0 or unconfirmed_balance > 0):
+                # PARTIAL PAYMENT DETECTED - Update invoice to show balance even if not full payment
+                logging.info(f"⚠️ Partial payment detected for order {oid[:8]}: {format_ltc(confirmed_balance)} LTC confirmed, {format_ltc(unconfirmed_balance)} LTC unconfirmed (expected: {format_ltc(Decimal(str(order_dict['price_ltc'])))} LTC)")
+                await update_invoice_callback(order_dict, balance_info)
+
         except Exception as e:
             logging.error(f"Error checking payment for order {oid}: {e}")
+            # Continue processing other orders even if one fails
+            continue
 
     logging.info(f"Payment poll summary: checked {checked_count}/{len(pending_orders)} orders, {len(orders_with_payment)} payments detected")
 
@@ -190,11 +283,22 @@ async def check_payments(
             await process_payment_delivery_callback(
                 order_dict, balance_info, bot_instance,
                 update_invoice_callback, update_user_order_message, update_stock_message,
-                notify_next_in_queue, send_log_embed_callback, get_reserved_stock_items_for_order_callback,
+                notify_next_in_queue, send_log_embed_callback,
                 build_seller_payout_outputs_callback
             )
         except Exception as e:
-            logging.error(f"Error processing delivery for order {order_dict['id']}: {e}")
+            oid = order_dict['id']
+            logging.error(f"Error processing delivery for order {oid}: {e}")
+            # Mark order as failed if delivery processing fails
+            try:
+                conn = get_db(DB_FILE)
+                c = conn.cursor()
+                c.execute("UPDATE orders SET status = 'failed', error_message = ? WHERE id = ?", (str(e), oid))
+                conn.commit()
+                conn.close()
+                logging.warning(f"Marked order {oid[:8]} as failed due to delivery error")
+            except Exception as db_e:
+                logging.error(f"Failed to update order status for {oid}: {db_e}")
 
 
 async def handle_blockcypher_webhook_event(
@@ -202,11 +306,10 @@ async def handle_blockcypher_webhook_event(
     address: str,
     bot_instance,
     update_invoice_callback,
+    refresh_order_message_callback,
     process_automatic_refund_callback,
     process_payment_delivery_callback,
-    release_reserved_stock_callback,
     send_log_embed_callback,
-    get_reserved_stock_items_for_order_callback,
     build_seller_payout_outputs_callback,
 ) -> bool:
     """Handle incoming BlockCypher webhook events for a single order."""
@@ -234,8 +337,8 @@ async def handle_blockcypher_webhook_event(
         logging.warning(f"Webhook event for order {order_id} could not fetch balance")
         return False
 
-    confirmed_balance = litoshi_to_ltc_callback(balance_info.get('balance', 0))
-    unconfirmed_balance = litoshi_to_ltc_callback(balance_info.get('unconfirmed_balance', 0))
+    confirmed_balance = litoshi_to_ltc(balance_info.get('balance', 0))
+    unconfirmed_balance = litoshi_to_ltc(balance_info.get('unconfirmed_balance', 0))
     now = datetime.now(timezone.utc).timestamp()
     processed = False
     delivery_candidates: list[tuple[dict, dict]] = []
@@ -260,15 +363,41 @@ async def handle_blockcypher_webhook_event(
     if order_dict['status'] == 'pending' and confirmed_balance >= expected_amount - tolerance:
         logging.info(f"Webhook payment detected for order {oid[:8]} at {address}")
         await _cleanup_hook()
+        
+        # Extract transaction ID and confirmations (same as polling handler)
+        payment_txid = None
+        payment_confirmations = 0
+        try:
+            from shopbot.crypto import get_address_transactions
+            transactions = await get_address_transactions(address)
+            
+            # Find the transaction that brought the balance to the expected amount
+            payment_tx = None
+            for tx in transactions:
+                if tx.get('value', 0) > 0:  # Incoming transaction
+                    tx_value_ltc = litoshi_to_ltc(tx.get('value', 0))
+                    if abs(tx_value_ltc - expected_amount) <= tolerance:
+                        payment_tx = tx
+                        break
+            
+            if payment_tx:
+                payment_txid = payment_tx.get('tx_hash')
+                payment_confirmations = payment_tx.get('confirmations', 0)
+                logging.info(f"Captured transaction for order {oid[:8]}: {payment_txid} ({payment_confirmations} confirmations)")
+        except Exception as e:
+            logging.warning(f"Failed to extract transaction details for webhook order {oid[:8]}: {e}")
+        
         conn = get_db(DB_FILE)
         c = conn.cursor()
         c.execute(
-            "UPDATE orders SET status = 'paid', paid_at = ?, payment_detected_at = ? WHERE id = ?",
-            (now, now, oid)
+            "UPDATE orders SET status = 'paid', paid_at = ?, payment_detected_at = ?, payment_txid = ?, payment_confirmations = ? WHERE id = ?",
+            (now, now, payment_txid, payment_confirmations, oid)
         )
         conn.commit()
         conn.close()
         order_dict['status'] = 'paid'
+        if payment_txid:
+            order_dict['payment_txid'] = payment_txid
         await update_invoice_callback(order_dict, balance_info)
         delivery_candidates.append((order_dict, balance_info))
         processed = True
@@ -284,12 +413,22 @@ async def handle_blockcypher_webhook_event(
         await process_automatic_refund_callback(order_dict, balance_info, bot_instance)
         processed = True
 
+    elif order_dict['status'] == 'pending' and (confirmed_balance > 0 or unconfirmed_balance > 0):
+        # PARTIAL PAYMENT - Update invoice to show balance even if not full amount
+        await _cleanup_hook()
+        logging.info(f"⚠️ Webhook detected partial payment for order {oid[:8]}: {format_ltc(confirmed_balance)} LTC confirmed (expected: {format_ltc(expected_amount)} LTC)")
+        await update_invoice_callback(order_dict, balance_info)
+        # Also refresh the user's order message to show updated payment status
+        if refresh_order_message_callback:
+            await refresh_order_message_callback(order_dict)
+        processed = True
+
     for order_dict, balance_info in delivery_candidates:
         try:
             await process_payment_delivery_callback(
                 order_dict, balance_info, bot_instance,
                 update_invoice_callback, update_user_order_message, update_stock_message,
-                notify_next_in_queue, send_log_embed_callback, get_reserved_stock_items_for_order_callback,
+                notify_next_in_queue, send_log_embed_callback,
                 build_seller_payout_outputs_callback
             )
         except Exception as e:

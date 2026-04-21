@@ -24,7 +24,7 @@ def load_config():
                 logging.error(f"config.json bot section missing: {key}")
                 exit(1)
 
-        crypto_keys = ["receiving_address", "payment_timeout", "poll_interval", "ltc_confirmations", "reservation_timeout"]
+        crypto_keys = ["receiving_address", "payment_timeout", "poll_interval", "ltc_confirmations"]
         for key in crypto_keys:
             if key not in config["crypto"]:
                 logging.error(f"config.json crypto section missing: {key}")
@@ -75,7 +75,7 @@ TOKEN                     = os.getenv("BOT_TOKEN")
 BLOCKCYPHER_TOKEN         = os.getenv("BLOCKCYPHER_TOKEN")
 WALLET_SEED               = os.getenv("WALLET_SEED")
 WEBHOOK_HOST              = os.getenv("WEBHOOK_HOST", "0.0.0.0")
-WEBHOOK_PORT              = int(os.getenv("WEBHOOK_PORT", "8080"))
+WEBHOOK_PORT              = int(os.getenv("WEBHOOK_PORT", "8081"))
 WEBHOOK_BASE_URL          = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")
 WEBHOOK_SECRET            = os.getenv("WEBHOOK_SECRET", "").strip()
 BLOCKCYPHER_WEBHOOK_EVENT = os.getenv("BLOCKCYPHER_WEBHOOK_EVENT", "tx-confirmation").strip()
@@ -105,6 +105,7 @@ def get_next_blockcypher_token():
     return token
 
 PREFIX            = CONFIG["bot"]["prefix"]
+OWNER_ID          = CONFIG["bot"].get("owner_id")
 ADMIN_ROLE_ID     = int(CONFIG["bot"]["admin_role"])
 SELLER_ROLE_ID    = int(CONFIG["bot"]["seller_role"])
 raw_invoice_channel = CONFIG["bot"].get("invoice_channel_id")

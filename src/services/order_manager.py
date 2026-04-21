@@ -5,7 +5,7 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 from shopbot.database import get_db
-from utils import INVOICE_CHANNEL_ID, COLORS, get_order_expiration_footer, PAYMENT_TIMEOUT
+from utils import INVOICE_CHANNEL_ID, COLORS, ORDER_STATUS_LABELS, get_order_expiration_footer, PAYMENT_TIMEOUT
 from ui.embeds import build_invoice_embed
 from ui.views import InvoiceApproveView, OrderCancelView
 
@@ -35,7 +35,7 @@ async def update_invoice_message(order: dict, balance_info: dict | None, get_cha
         except Exception as tx_err:
             logging.debug(f"Could not fetch transactions for order {order['id']}: {tx_err}")
 
-        disabled = order['status'] in {'delivered', 'expired', 'failed', 'sweep_failed', 'canceled', 'refunded'}
+        disabled = order['status'] in {'delivered', 'expired', 'failed', 'sweep_failed', 'canceled', 'refunded', 'paid'}
 
         # Show refund button if there's balance on the address (for manual refunds)
         show_refund = False
@@ -43,8 +43,12 @@ async def update_invoice_message(order: dict, balance_info: dict | None, get_cha
         if balance_info:
             confirmed = litoshi_to_ltc_callback(balance_info.get('balance', 0))
             unconfirmed = litoshi_to_ltc_callback(balance_info.get('unconfirmed_balance', 0))
+            
+            # Show refund for any balance on canceled/pending/expired orders
             if (confirmed > 0 or unconfirmed > 0) and order['status'] in {'canceled', 'pending', 'expired'}:
                 show_refund = True
+            
+            # Show sweep for ANY confirmed balance (full or partial payment)
             if confirmed > 0 and order['status'] == 'pending':
                 show_sweep = True
 
@@ -55,8 +59,8 @@ async def update_invoice_message(order: dict, balance_info: dict | None, get_cha
         logging.error(f"Could not update invoice message for order {order['id']}: {e}", exc_info=True)
 
 
-async def refresh_invoice_message(order: dict, get_channel_callback, get_product_callback):
-    """Refresh the invoice message without balance info"""
+async def refresh_invoice_message(order: dict, get_channel_callback, get_product_callback, get_address_balance_callback=None, litoshi_to_ltc_callback=None):
+    """Refresh the invoice message and preserve balance info if available"""
     channel_id = order.get('invoice_channel_id') or INVOICE_CHANNEL_ID
     message_id = order.get('invoice_message_id')
     if not channel_id or not message_id:
@@ -72,9 +76,36 @@ async def refresh_invoice_message(order: dict, get_channel_callback, get_product
         if not product:
             return
 
-        disabled = order['status'] in {'delivered', 'expired', 'failed', 'sweep_failed', 'canceled', 'refunded'}
-        view = InvoiceApproveView(order['id'], disabled=disabled)
-        await msg.edit(embed=build_invoice_embed(order, product, None), view=view)
+        # REAL-TIME: Always fetch fresh balance from blockchain for pending orders
+        balance_info = None
+        if order.get('status') == 'pending' and get_address_balance_callback and order.get('ltc_address'):
+            try:
+                balance_info = await get_address_balance_callback(order['ltc_address'])
+                logging.debug(f"🔄 Real-time balance update for order {order['id'][:8]}: {balance_info}")
+            except Exception as e:
+                logging.debug(f"Could not fetch fresh balance during refresh for order {order['id']}: {e}")
+                # On error, don't update - preserve existing display
+                return
+
+        disabled = order['status'] in {'delivered', 'expired', 'failed', 'sweep_failed', 'canceled', 'refunded', 'paid'}
+        
+        # Calculate button visibility
+        show_refund = False
+        show_sweep = False
+        if balance_info:
+            confirmed = litoshi_to_ltc_callback(balance_info.get('balance', 0)) if litoshi_to_ltc_callback else None
+            unconfirmed = litoshi_to_ltc_callback(balance_info.get('unconfirmed_balance', 0)) if litoshi_to_ltc_callback else None
+            if confirmed is not None and unconfirmed is not None:
+                # Show refund for any balance on canceled/pending/expired orders
+                if (confirmed > 0 or unconfirmed > 0) and order['status'] in {'canceled', 'pending', 'expired'}:
+                    show_refund = True
+                
+                # Show sweep for ANY confirmed balance (full or partial payment)
+                if confirmed > 0 and order['status'] == 'pending':
+                    show_sweep = True
+        
+        view = InvoiceApproveView(order['id'], disabled=disabled, show_refund=show_refund, show_sweep=show_sweep)
+        await msg.edit(embed=build_invoice_embed(order, product, balance_info), view=view)
     except Exception as e:
         logging.debug(f"Could not refresh invoice message for order {order['id']}: {e}")
 
@@ -100,8 +131,8 @@ def build_order_embed(order: dict, product: dict, format_ltc_callback) -> 'disco
         total_usd = float(price_usd) * float(quantity)
         em.add_field(name="Total USD Price", value=f"${total_usd:.2f}", inline=True)
     em.add_field(name="Order ID", value=f"`{order['id'][:8]}`", inline=True)
-    em.add_field(name="Blockchain", value="Litecoin", inline=True)
-    em.add_field(name="Status", value=order.get('status', 'pending').capitalize(), inline=True)
+    status_label = ORDER_STATUS_LABELS.get(order.get('status', 'pending'), order.get('status', 'pending').capitalize())
+    em.add_field(name="Status", value=status_label, inline=True)
     em.add_field(name="Payment Address", value=f"```{order['ltc_address']}```", inline=False)
     if order.get('status') == 'canceled':
         em.add_field(
@@ -209,6 +240,7 @@ async def refresh_order_message(order: dict, get_channel_callback, get_product_c
         return
 
     try:
+        logging.info(f"Refreshing order message for order {order['id']} (channel_id={channel_id}, message_id={message_id})")
         channel = await get_channel_callback(channel_id)
         if channel is None and order.get('user_id'):
             try:
@@ -216,10 +248,12 @@ async def refresh_order_message(order: dict, get_channel_callback, get_product_c
                 user = bot_instance.get_user(user_id_int) or await bot_instance.fetch_user(user_id_int)
                 if user:
                     channel = user.dm_channel or await user.create_dm()
+                    logging.info(f"Resolved DM channel for order {order['id']} via user {user_id_int}")
             except Exception as e:
-                logging.debug(f"Could not resolve DM channel for order {order['id']} user {order.get('user_id')}: {e}")
+                logging.warning(f"Could not resolve DM channel for order {order['id']} user {order.get('user_id')}: {e}")
 
         if channel is None:
+            logging.warning(f"Unable to refresh order message for order {order['id']}: channel not available")
             return
 
         msg = await channel.fetch_message(int(message_id))
@@ -231,7 +265,7 @@ async def refresh_order_message(order: dict, get_channel_callback, get_product_c
         view = OrderCancelView(order['id'], disabled=disabled)
         await msg.edit(embed=build_order_embed_callback(order, product), view=view)
     except Exception as e:
-        logging.debug(f"Could not refresh order message for order {order['id']}: {e}")
+        logging.warning(f"Could not refresh order message for order {order['id']}: {e}")
 
 
 async def refresh_pending_invoice_messages(all_orders_callback, update_invoice_callback):

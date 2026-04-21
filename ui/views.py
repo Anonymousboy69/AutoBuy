@@ -17,11 +17,12 @@ from shopbot.crypto import find_address_path_by_address, sweep_payment, litoshi_
 
 # Import from utils
 from utils import (
-    CONFIG, DB_FILE, COLORS, STATUS_EMOJI, PAYMENT_TIMEOUT, RESERVATION_TIMEOUT, POLL_INTERVAL,
+    CONFIG, DB_FILE, COLORS, STATUS_EMOJI, PAYMENT_TIMEOUT, POLL_INTERVAL,
     LTC_CONFIRMATIONS, RESTOCK_RATE_LIMIT, LOW_STOCK_THRESHOLD, MAX_SWEEP_ATTEMPTS,
     SWEEP_RETRY_BACKOFF, MAX_REFUND_ATTEMPTS, RESTOCKING_STATUS,
     get_expiration_footer, get_expiration_timestamp, mask_wallet_address, format_usd,
     user_has_admin_or_seller_role, admin_check_interaction, seller_check_interaction,
+    owner_or_admin_check_interaction,
     admin_or_seller_check_interaction, is_admin, RECEIVING_ADDRESS, WALLET_SEED,
     get_next_blockcypher_token
 )
@@ -59,7 +60,10 @@ from ui.modals import (
 
 
 def _get_bot_module():
-    return importlib.import_module('bot')
+    try:
+        return importlib.import_module('src.bot')
+    except ModuleNotFoundError:
+        return importlib.import_module('bot')
 
 
 def get_user_wallet(user_id: str) -> Optional[dict]:
@@ -95,7 +99,7 @@ class PartialPaymentConfirmView(discord.ui.View):
         self.balance_info = balance_info
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not admin_check_interaction(interaction):
+        if not owner_or_admin_check_interaction(interaction):
             await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
             return False
         return True
@@ -130,7 +134,7 @@ class PartialPaymentConfirmView(discord.ui.View):
 
         address_path = order.get("address_path")
         if not address_path:
-            address_path = find_address_path_by_address(order['ltc_address'])
+            address_path = find_address_path_by_address(DB_FILE, order['ltc_address'], WALLET_SEED)
             if address_path:
                 conn = get_db(DB_FILE)
                 c = conn.cursor()
@@ -156,7 +160,7 @@ class PartialPaymentConfirmView(discord.ui.View):
             RECEIVING_ADDRESS,
             get_next_blockcypher_token(),
             LTC_CONFIRMATIONS,
-            recipients=recipients,
+            recipients=None,  # ⚠️ Don't pay sellers on partial payments - accumulate funds instead
         )
 
         if not swept:
@@ -216,7 +220,7 @@ class InvoiceApproveView(discord.ui.View):
                 self.sweep_and_deliver.disabled = True
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if not admin_check_interaction(interaction):
+        if not owner_or_admin_check_interaction(interaction):
             await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
             return False
         return True
@@ -354,15 +358,6 @@ class InvoiceApproveView(discord.ui.View):
             await interaction.response.defer(ephemeral=True)
             
             try:
-                product = get_product(DB_FILE, order['product_id'])
-                await interaction.message.edit(
-                    embed=build_invoice_embed(order, product, {'balance': 0, 'unconfirmed_balance': 0}, processing=True),
-                    view=InvoiceApproveView(self.order_id, disabled=True, show_refund=False),
-                )
-            except Exception as e:
-                logging.warning(f"Could not update invoice message during sweep: {e}")
-
-            try:
                 balance_info = await asyncio.wait_for(get_address_balance(order['ltc_address']), timeout=10)
             except asyncio.TimeoutError:
                 await interaction.followup.send("❌ Balance check timed out. Try again in a moment.", ephemeral=True)
@@ -398,7 +393,7 @@ class InvoiceApproveView(discord.ui.View):
             address_path = order.get("address_path")
             if not address_path:
                 try:
-                    address_path = find_address_path_by_address(order['ltc_address'])
+                    address_path = find_address_path_by_address(DB_FILE, order['ltc_address'], WALLET_SEED)
                     if address_path:
                         conn = get_db(DB_FILE)
                         c = conn.cursor()
@@ -498,47 +493,66 @@ class OrderCancelView(discord.ui.View):
             self.cancel_order.disabled = True
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        order = get_order(DB_FILE, self.order_id)
-        if not order:
-            await interaction.response.send_message("❌ Order not found.", ephemeral=True)
-            return False
-        if str(interaction.user.id) != order['user_id']:
-            await interaction.response.send_message("🚫 You can only cancel your own order.", ephemeral=True)
-            return False
+        # Don't send response in check - let the button handler do it
         return True
 
     @discord.ui.button(label="❌ Cancel Order", style=discord.ButtonStyle.danger, custom_id="cancel_order")
     async def cancel_order(self, interaction: discord.Interaction, button: discord.ui.Button):
-        order = get_order(DB_FILE, self.order_id)
-        if not order:
-            await interaction.response.send_message("❌ Order not found.", ephemeral=True)
-            return
-
-        if order['status'] in {'paid', 'delivered', 'failed', 'expired', 'sweep_failed', 'canceled', 'refunded'}:
-            await interaction.response.send_message(
-                "❌ This order cannot be canceled at this stage.",
-                ephemeral=True,
-            )
-            return
-
         try:
-            await interaction.response.send_modal(ConfirmCancelModal(self.order_id))
-        except Exception as e:
-            logging.warning(f"Cancel order modal open failed for {self.order_id}: {e}")
-            try:
-                bot_mod = _get_bot_module()
-                await bot_mod.do_cancel_order(interaction, self.order_id)
+            order = get_order(DB_FILE, self.order_id)
+            if not order:
+                await interaction.response.send_message("❌ Order not found.", ephemeral=True)
                 return
-            except Exception as fallback_err:
-                logging.error(f"Fallback cancel failed for {self.order_id}: {fallback_err}")
-            if not interaction.response.is_done():
-                try:
-                    await interaction.response.send_message(
-                        "⚠️ Unable to open cancellation confirmation right now. Please try again in a moment.",
-                        ephemeral=True,
-                    )
-                except Exception:
-                    pass
+
+            if str(interaction.user.id) != order['user_id']:
+                await interaction.response.send_message("🚫 You can only cancel your own order.", ephemeral=True)
+                return
+
+            if order['status'] in {'paid', 'delivered', 'failed', 'expired', 'sweep_failed', 'canceled', 'refunded'}:
+                await interaction.response.send_message(
+                    "❌ This order cannot be canceled at this stage.",
+                    ephemeral=True,
+                )
+                return
+
+            try:
+                if interaction.response.is_done():
+                    try:
+                        await interaction.followup.send(
+                            "⚠️ Unable to open the cancellation confirmation because the interaction was already acknowledged. Please try again.",
+                            ephemeral=True,
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                await interaction.response.send_modal(ConfirmCancelModal(self.order_id))
+            except discord.NotFound:
+                logging.warning(f"Cancel order interaction expired for {self.order_id}")
+            except discord.HTTPException as e:
+                logging.warning(f"Cancel order modal open failed for {self.order_id}: {e}")
+                if not interaction.response.is_done():
+                    try:
+                        await interaction.response.send_message(
+                            "⚠️ Unable to open cancellation confirmation right now. Please try again in a moment.",
+                            ephemeral=True,
+                        )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logging.error(f"Unexpected error opening cancel modal for {self.order_id}: {e}", exc_info=True)
+                if not interaction.response.is_done():
+                    try:
+                        await interaction.response.send_message(
+                            "⚠️ An unexpected error occurred. Please try again.",
+                            ephemeral=True,
+                        )
+                    except Exception:
+                        pass
+        except discord.NotFound:
+            logging.error(f"Interaction token expired for order {self.order_id}")
+        except Exception as e:
+            logging.error(f"Unexpected error in cancel_order button: {e}", exc_info=True)
 
     @discord.ui.button(label="📱 Show QR", style=discord.ButtonStyle.blurple, custom_id="order_show_qr")
     async def show_qr(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -821,7 +835,7 @@ class StockItemPage(discord.ui.View):
         self.next_page.disabled = self.page >= len(self.stock_items) - 1
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if admin_check_interaction(interaction):
+        if owner_or_admin_check_interaction(interaction):
             return True
         seller_id = str(interaction.user.id)
         if any(str(item.get('restocked_by', '')).strip() != seller_id for item in self.stock_items):
@@ -845,7 +859,7 @@ class StockItemPage(discord.ui.View):
             return
         if self.page > 0:
             self.page -= 1
-        await self._refresh(interaction)
+        await self.refresh_view(interaction)
 
     @discord.ui.button(label="▶ Next", style=discord.ButtonStyle.secondary, row=0)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -854,7 +868,7 @@ class StockItemPage(discord.ui.View):
             return
         if self.page < len(self.stock_items) - 1:
             self.page += 1
-        await self._refresh(interaction)
+        await self.refresh_view(interaction)
 
     @discord.ui.button(label="✏️ Edit", style=discord.ButtonStyle.primary, row=0)
     async def edit_item(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -967,7 +981,7 @@ class StockItemPage(discord.ui.View):
         em.set_footer(text=f"Item {self.page + 1} of {len(self.stock_items)}")
         return em
 
-    async def _refresh(self, interaction: discord.Interaction):
+    async def refresh_view(self, interaction: discord.Interaction):
         self.prev_page.disabled = self.page == 0
         self.next_page.disabled = self.page >= len(self.stock_items) - 1
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
@@ -1005,25 +1019,69 @@ class ProductDetailView(discord.ui.View):
         super().__init__(timeout=None)
         self.product_id = product_id
 
+        self.buy_button = discord.ui.Button(
+            label="🛒 Buy Now - Click Here",
+            style=discord.ButtonStyle.success,
+            custom_id=f"product_buy_button:{product_id}",
+        )
+        self.buy_button.callback = self._buy_button_callback
+        self.add_item(self.buy_button)
+
         stock_count, _ = get_stock_status(DB_FILE, self.product_id)
         if stock_count == 0:
             self.buy_button.disabled = True
             self.buy_button.label = "❌ Out of stock"
             self.buy_button.style = discord.ButtonStyle.danger
 
-    @discord.ui.button(label="🛒 Buy Now - Click Here", style=discord.ButtonStyle.success, custom_id="product_buy_button")
-    async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        product = get_product(DB_FILE, self.product_id)
-        if not product:
-            await interaction.response.send_message("❌ Product no longer exists.", ephemeral=True)
-            return
-        
-        stock_count, _ = get_stock_status(DB_FILE, self.product_id)
-        if stock_count == 0:
-            await interaction.response.send_message("❌ This product is currently out of stock.", ephemeral=True)
-            return
-            
-        await interaction.response.send_modal(QuantityModal(self.product_id))
+    async def safe_send_modal(self, interaction: discord.Interaction, modal: discord.ui.Modal):
+        try:
+            await interaction.response.send_modal(modal)
+        except discord.NotFound as e:
+            logging.warning(f"[!] Modal send failed: {e}")
+            if not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(
+                        "⚠️ Unable to open the modal because the interaction is no longer valid. Please refresh and try again.",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+        except discord.HTTPException as e:
+            logging.error(f"[!] HTTP error sending modal: {e}")
+            if not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(
+                        "⚠️ Unable to open the modal right now. Please try again.",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logging.error(f"[!] Unexpected error sending modal: {e}")
+            if not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(
+                        "⚠️ Something went wrong when opening the modal.",
+                        ephemeral=True,
+                    )
+                except Exception:
+                    pass
+
+    async def _buy_button_callback(self, interaction: discord.Interaction):
+        logging.info(f"Product buy button clicked for product={self.product_id} user={interaction.user.id}")
+        try:
+            # Repair HTTP client before any channel fetches
+            from src.http_utils import ensure_http_client_ready
+            await ensure_http_client_ready(interaction.client)
+            logging.info(f"Immediately opening QuantityModal for product {self.product_id}")
+            await self.safe_send_modal(interaction, QuantityModal(self.product_id))
+        except Exception as e:
+            logging.error(f"Unexpected error in buy_button for product {self.product_id}: {e}", exc_info=True)
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("❌ An unexpected error occurred. Please try again.", ephemeral=True)
+            except Exception:
+                pass
 
 
 
@@ -1085,7 +1143,7 @@ class RestockView(discord.ui.View):
     async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
         conn = get_db(DB_FILE)
         c = conn.cursor()
-        if admin_check_interaction(interaction):
+        if owner_or_admin_check_interaction(interaction):
             c.execute("UPDATE stock_items SET status = ? WHERE product_id = ? AND status = ?", ("pending", self.product_id, RESTOCKING_STATUS))
         else:
             seller_id = str(interaction.user.id)
@@ -1127,7 +1185,7 @@ class RestockView(discord.ui.View):
         """Cancel restocking session and delete staged items."""
         conn = get_db(DB_FILE)
         c = conn.cursor()
-        if admin_check_interaction(interaction):
+        if owner_or_admin_check_interaction(interaction):
             c.execute(
                 "DELETE FROM stock_items WHERE product_id = ? AND status = ?",
                 (self.product_id, RESTOCKING_STATUS),
@@ -1722,7 +1780,7 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="New", style=discord.ButtonStyle.success, emoji="🆕", custom_id="admin_panel_new", row=0)
     async def add_product_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not admin_check_interaction(interaction):
+        if not owner_or_admin_check_interaction(interaction):
             await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
             return
         view = start_product_builder(interaction)
@@ -1748,7 +1806,7 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="Analytics", style=discord.ButtonStyle.secondary, emoji="📈", custom_id="admin_panel_analytics", row=0)
     async def analytics_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not admin_check_interaction(interaction):
+        if not owner_or_admin_check_interaction(interaction):
             await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
@@ -1787,7 +1845,7 @@ class AdminPanelView(discord.ui.View):
     @discord.ui.button(label="Edit", style=discord.ButtonStyle.primary, emoji="✏️", custom_id="admin_panel_edit", row=1)
     async def edit_product_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            if not admin_check_interaction(interaction):
+            if not owner_or_admin_check_interaction(interaction):
                 await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
                 return
             await interaction.response.send_modal(EditProductModal())
@@ -1804,7 +1862,7 @@ class AdminPanelView(discord.ui.View):
     @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="admin_panel_delete", row=1)
     async def delete_product_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
-            if not admin_check_interaction(interaction):
+            if not owner_or_admin_check_interaction(interaction):
                 await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
                 return
             await interaction.response.send_modal(DeleteProductModal())
@@ -1837,7 +1895,7 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="Orders", style=discord.ButtonStyle.secondary, emoji="📋", custom_id="admin_panel_orders", row=1)
     async def all_orders_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not admin_check_interaction(interaction):
+        if not owner_or_admin_check_interaction(interaction):
             await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
             return
         bot_mod = _get_bot_module()
@@ -1845,7 +1903,7 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="Health", style=discord.ButtonStyle.secondary, emoji="⚡", custom_id="admin_panel_health", row=2)
     async def db_health_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not admin_check_interaction(interaction):
+        if not owner_or_admin_check_interaction(interaction):
             await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
@@ -1932,7 +1990,7 @@ class AdminPanelView(discord.ui.View):
 
     @discord.ui.button(label="Audit", style=discord.ButtonStyle.secondary, emoji="📜", custom_id="admin_panel_audit", row=2)
     async def audit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not admin_check_interaction(interaction):
+        if not owner_or_admin_check_interaction(interaction):
             await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
             return
         await interaction.response.send_modal(AuditProductModal())

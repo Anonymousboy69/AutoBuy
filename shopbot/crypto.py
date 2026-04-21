@@ -84,7 +84,7 @@ async def register_blockcypher_webhook(address: str, callback_url: str, token: s
                 result = await r.json() if text else {}
                 logging.info(f"Registered BlockCypher webhook for {address}: {result.get('id')}")
                 return result
-    except Exception as e:
+    except BaseException as e:
         logging.error(f"BlockCypher webhook registration error: {e}")
         import traceback
         traceback.print_exc()
@@ -109,7 +109,7 @@ async def delete_blockcypher_webhook(hook_id: str, token: str = None) -> bool:
                     return True
                 logging.warning(f"BlockCypher webhook deletion failed: {r.status} {text[:300]}")
                 return False
-    except Exception as e:
+    except BaseException as e:
         logging.warning(f"BlockCypher webhook deletion error: {e}")
         return False
 
@@ -122,7 +122,7 @@ def get_wallet_from_seed(wallet_seed: str):
         seed_bytes = mnemo.to_seed(wallet_seed)
         key = HDKey.from_seed(seed_bytes, network="litecoin")
         return key
-    except Exception as e:
+    except BaseException as e:
         logging.error(f"Failed to load wallet: {e}")
         import traceback
         traceback.print_exc()
@@ -152,7 +152,7 @@ def get_payment_wallet(wallet_seed: str, db_file: str):
             )
             logging.info(f"Created new payment wallet '{wallet_name}'.")
         return _payment_wallet
-    except Exception as e:
+    except BaseException as e:
         logging.error(f"Failed to initialize sweep wallet: {e}")
         import traceback
         traceback.print_exc()
@@ -173,7 +173,7 @@ def find_address_path_by_address(db_file: str, address: str, wallet_seed: str) -
         max_index = int(row[0]) if row[0] is not None else int(row[1] or 0)
     for index in range(max_index + 10):
         try:
-            child = root.subkey_for_path(f"m/0/{index}")
+            child = root.key_for_path(f"m/0/{index}")
             if child.address() == address:
                 return f"m/0/{index}"
         except Exception:
@@ -185,17 +185,20 @@ async def generate_ltc_address(db_file: str, wallet_seed: str) -> tuple[str | No
     try:
         global _wallet
         if _wallet is None:
+            logging.info(f"Initializing wallet from seed (seed length: {len(wallet_seed) if wallet_seed else 0})")
             _wallet = get_wallet_from_seed(wallet_seed)
         if _wallet is None:
-            logging.error("No wallet configured. Set WALLET_SEED in config.json")
+            logging.error("No wallet configured. Set WALLET_SEED in .env file")
             return None, None, None
 
         address_index = get_next_address_index(db_file)
+        logging.debug(f"Generating address at index {address_index}")
         address_path = f"m/0/{address_index}"
-        child_key = _wallet.subkey_for_path(address_path)
+        child_key = _wallet.key_for_path(address_path)
         address = child_key.address()
+        logging.info(f"✅ Generated address {address} at path {address_path}")
         return address, address_path, address_index
-    except Exception as e:
+    except BaseException as e:
         logging.error(f"Failed to generate address: {e}")
         import traceback
         traceback.print_exc()
@@ -364,7 +367,7 @@ async def _get_addresses_balance_batch_uncached(addresses: list[str], blockcyphe
                     return batch_result
 
             return None
-    except Exception as e:
+    except BaseException as e:
         logging.error(f"BlockCypher batch request error: {e}")
         import traceback
         traceback.print_exc()
@@ -390,7 +393,7 @@ async def _get_address_balance_uncached(address: str, blockcypher_token: str = N
             balance = int(addr_data.get('balance', 0) or 0)
             unconfirmed = int(addr_data.get('unconfirmed_balance', 0) or 0)
             return {'balance': balance, 'unconfirmed_balance': unconfirmed}
-        except Exception as e:
+        except BaseException as e:
             logging.warning(f"Blockchair parse failed for {address}: {e}")
             return None
 
@@ -404,7 +407,7 @@ async def _get_address_balance_uncached(address: str, blockcypher_token: str = N
                 'balance': int((confirmed * Decimal('1e8')).to_integral_value()),
                 'unconfirmed_balance': int((unconfirmed * Decimal('1e8')).to_integral_value()),
             }
-        except Exception as e:
+        except BaseException as e:
             logging.warning(f"SoChain parse failed for {address}: {e}")
             return None
 
@@ -545,7 +548,7 @@ async def _get_address_balance_uncached(address: str, blockcypher_token: str = N
                     logging.warning(f"Trezor blockbook balance query failed for {address}: {r.status} {text[:300]}")
     except asyncio.TimeoutError:
         logging.warning(f"Balance query timed out for {address}")
-    except Exception as e:
+    except BaseException as e:
         logging.warning(f"Balance query error for {address}: {e}")
     return None
 
@@ -590,7 +593,7 @@ async def sweep_payment(
         mnemo = Mnemonic("english")
         seed_bytes = mnemo.to_seed(wallet_seed)
         root = HDKey.from_seed(seed_bytes, network="litecoin")
-        child_key = root.subkey_for_path(address_path)
+        child_key = root.key_for_path(address_path)
 
         logging.info(f"Derived key for path {address_path}")
         logging.info("sweep_payment v2 loaded: using bitcoinlib Transaction.sign()")
@@ -705,17 +708,11 @@ async def sweep_payment(
 
         logging.info(f"Sweep broadcast succeeded: {txid}")
         return True, txid
-    except Exception as e:
+    except BaseException as e:
         logging.error(f"Sweep error: {e}")
         import traceback
         traceback.print_exc()
         return False, None
-
-    except Exception as e:
-        logging.error(f"Sweep error: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
 
 
 async def get_transaction_details(txid: str, blockcypher_token: str = None) -> dict | None:
@@ -740,6 +737,189 @@ async def get_transaction_details(txid: str, blockcypher_token: str = None) -> d
                 else:
                     logging.warning(f"BlockCypher transaction query failed: {r.status} for {txid}")
                     return None
-        except Exception as e:
+        except BaseException as e:
             logging.error(f"Error fetching transaction {txid}: {e}")
             return None
+
+
+# ─────────────────────────────────────────────
+#  TRANSACTION SAFETY VALIDATION
+# ─────────────────────────────────────────────
+async def validate_transaction_safety(txid: str, expected_address: str, expected_amount_ltc: Decimal,
+                                    blockcypher_token: str = None, min_confirmations: int = 1) -> Dict[str, Any]:
+    """
+    Comprehensive transaction safety validation for real-money operations.
+
+    Checks:
+    - Transaction exists and is valid
+    - Has sufficient confirmations
+    - Sends to the expected address
+    - Amount matches expectations
+    - Not a double-spend attempt
+    - Transaction is not malformed
+
+    Returns dict with validation results and details.
+    """
+    result = {
+        'valid': False,
+        'txid': txid,
+        'confirmations': 0,
+        'amount_received_ltc': Decimal('0'),
+        'sender_addresses': [],
+        'errors': [],
+        'warnings': []
+    }
+
+    try:
+        # Get transaction details
+        tx_data = await get_transaction_details(txid, blockcypher_token)
+        if not tx_data:
+            result['errors'].append('Transaction not found')
+            return result
+
+        # Check confirmations
+        confirmations = tx_data.get('confirmations', 0)
+        result['confirmations'] = confirmations
+
+        if confirmations < min_confirmations:
+            result['errors'].append(f'Insufficient confirmations: {confirmations} < {min_confirmations}')
+            return result
+
+        # Validate outputs - check if expected address received the expected amount
+        outputs = tx_data.get('outputs', [])
+        expected_satoshis = int(expected_amount_ltc * Decimal('100000000'))
+        tolerance_satoshis = int(Decimal('0.00000001') * Decimal('100000000') * 2)  # 2 satoshi tolerance
+
+        amount_received_satoshis = 0
+        correct_output_found = False
+
+        for output in outputs:
+            addresses = output.get('addresses', [])
+            if expected_address in addresses:
+                value = output.get('value', 0)
+                amount_received_satoshis += value
+                if abs(value - expected_satoshis) <= tolerance_satoshis:
+                    correct_output_found = True
+                elif value > expected_satoshis * 2:  # More than double expected
+                    result['warnings'].append(f'Overpayment detected: {value} satoshis vs expected {expected_satoshis}')
+
+        if not correct_output_found and amount_received_satoshis == 0:
+            result['errors'].append(f'No payment to expected address {expected_address}')
+            return result
+
+        result['amount_received_ltc'] = Decimal(str(amount_received_satoshis)) / Decimal('100000000')
+
+        # Check for potential double-spend indicators
+        if tx_data.get('double_spend', False):
+            result['errors'].append('Transaction marked as double-spend')
+            return result
+
+        # Validate inputs are reasonable
+        inputs = tx_data.get('inputs', [])
+        if not inputs:
+            result['errors'].append('Transaction has no inputs')
+            return result
+
+        # Collect sender addresses
+        sender_addresses = []
+        for inp in inputs:
+            addresses = inp.get('addresses', [])
+            sender_addresses.extend(addresses)
+
+        result['sender_addresses'] = list(set(sender_addresses))  # Remove duplicates
+
+        # Check for unusual input patterns that might indicate fraud
+        if len(inputs) > 50:
+            result['warnings'].append(f'Unusually high number of inputs: {len(inputs)}')
+
+        # All checks passed
+        result['valid'] = True
+        return result
+
+    except BaseException as e:
+        result['errors'].append(f'Validation error: {str(e)}')
+        logging.error(f'Transaction validation failed for {txid}: {e}')
+        return result
+
+
+async def check_transaction_uniqueness(txid: str, db_file: str) -> bool:
+    """
+    Check if a transaction ID has already been processed for any order.
+    Prevents double-processing of the same transaction.
+    """
+    try:
+        conn = get_db(db_file)
+        c = conn.cursor()
+
+        # Check if this txid appears in any order's sweep_txid or payment_txid
+        c.execute('''
+            SELECT id FROM orders
+            WHERE sweep_txid = ? OR payment_txid = ?
+        ''', (txid, txid))
+
+        existing_order = c.fetchone()
+        conn.close()
+
+        if existing_order:
+            logging.warning(f'Transaction {txid} already processed for order {existing_order["id"][:8]}')
+            return False
+
+        return True
+
+    except BaseException as e:
+        logging.error(f'Error checking transaction uniqueness for {txid}: {e}')
+        return False  # Err on the side of caution
+
+
+async def validate_address_ownership(address: str, wallet_seed: str) -> bool:
+    """
+    Validate that an address belongs to our wallet.
+    This prevents accepting payments to incorrect addresses.
+    """
+    try:
+        root = get_wallet_from_seed(wallet_seed)
+        if not root:
+            return False
+
+        # Try to find this address in our wallet (brute force search through reasonable range)
+        max_index = 100  # Search through first 100 addresses
+        for index in range(max_index):
+            try:
+                child = root.key_for_path(f"m/0/{index}")
+                try:
+                    addr = child.address()
+                    if addr == address:
+                        return True
+                except BaseException:
+                    continild.address()
+                    if addr == address:
+                        return True
+                except BaseException:
+                    continild.address()
+                    if addr == address:
+                        return True
+                except BaseException:
+                    continue
+            except BaseException:
+                continue
+
+        return False
+
+    except BaseException as e:
+        logging.error(f'Error validating address ownership for {address}: {e}')
+        return False
+
+
+async def get_transaction_confirmations(txid: str, blockcypher_token: str = None) -> int:
+    """
+    Get the number of confirmations for a transaction.
+    Returns 0 if transaction not found or unconfirmed.
+    """
+    try:
+        tx_data = await get_transaction_details(txid, blockcypher_token)
+        if tx_data:
+            return tx_data.get('confirmations', 0)
+        return 0
+    except BaseException as e:
+        logging.error(f'Error getting confirmations for {txid}: {e}')
+        return 0

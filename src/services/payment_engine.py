@@ -7,12 +7,13 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Optional, Dict, List, Tuple
 from discord.ext import tasks
 
-from shopbot.database import get_db, get_order, all_orders, get_product, assign_order_stock_to_order, log_audit
+from shopbot.database import get_db, get_order, all_orders, log_audit
+from src.database.wrappers import get_product, assign_order_stock_to_order
 from shopbot.crypto import sweep_payment, get_address_balance, litoshi_to_ltc, format_ltc, find_address_path_by_address
 from utils import (
     DB_FILE, LTC_CONFIRMATIONS, MAX_SWEEP_ATTEMPTS, SWEEP_RETRY_BACKOFF,
     MAX_REFUND_ATTEMPTS, RECEIVING_ADDRESS, COLORS, LOGGING_CHANNEL_ID,
-    PAYMENT_TIMEOUT, RESERVATION_TIMEOUT, POLL_INTERVAL, WALLET_SEED,
+    PAYMENT_TIMEOUT, POLL_INTERVAL, WALLET_SEED,
     get_next_blockcypher_token
 )
 
@@ -78,20 +79,35 @@ async def process_automatic_refund(order_dict, balance_info, bot_instance):
     refund_txid = None
     sweep_success = False
 
-    try:
-        sweep_success, refund_txid = await sweep_payment(
-            DB_FILE,
-            address_path,
-            order_dict['ltc_address'],
-            refund_amount,
-            WALLET_SEED,
-            RECEIVING_ADDRESS,
-            get_next_blockcypher_token(),
-            LTC_CONFIRMATIONS,
-            recipients=None,
-        )
-    except Exception as e:
-        logging.error(f"Refund sweep failed for order {oid[:8]}: {e}")
+    # Retry refund sweep up to 3 times
+    max_refund_retries = 3
+    for refund_attempt in range(max_refund_retries):
+        try:
+            sweep_success, refund_txid = await sweep_payment(
+                DB_FILE,
+                address_path,
+                order_dict['ltc_address'],
+                refund_amount,
+                WALLET_SEED,
+                RECEIVING_ADDRESS,
+                get_next_blockcypher_token(),
+                LTC_CONFIRMATIONS,
+                recipients=None,
+            )
+            if sweep_success:
+                break
+            elif refund_attempt < max_refund_retries - 1:
+                wait_time = 2 ** refund_attempt
+                logging.warning(f"Refund sweep attempt {refund_attempt + 1} failed for order {oid[:8]}, retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+        except Exception as refund_e:
+            if refund_attempt < max_refund_retries - 1:
+                wait_time = 2 ** refund_attempt
+                logging.warning(f"Refund sweep attempt {refund_attempt + 1} failed for order {oid[:8]}: {refund_e}, retrying in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+            else:
+                logging.error(f"All refund sweep attempts failed for order {oid[:8]}: {refund_e}")
+                sweep_success = False
 
     # Update order with refund info
     now = datetime.now(timezone.utc).timestamp()
@@ -133,7 +149,7 @@ async def process_automatic_refund(order_dict, balance_info, bot_instance):
         logging.warning(f"Could not notify user {user_id} about refund for order {oid[:8]}: {e}")
 
 
-async def process_payment_delivery(order_dict, balance_info, bot_instance, update_invoice_callback, update_user_order_callback, update_stock_callback, notify_next_callback, send_log_callback, get_reserved_stock_callback, build_seller_payout_callback):
+async def process_payment_delivery(order_dict, balance_info, bot_instance, update_invoice_callback, update_user_order_callback, update_stock_callback, notify_next_callback, send_log_callback, build_seller_payout_callback):
     """Process delivery for a paid order"""
     oid = order_dict['id']
     user_id = order_dict['user_id']
@@ -179,6 +195,20 @@ async def process_payment_delivery(order_dict, balance_info, bot_instance, updat
     max_attempts = MAX_SWEEP_ATTEMPTS
 
     if sweep_attempts < max_attempts:
+        # Build seller payout recipients list
+        recipients = None
+        payout_error = None
+        try:
+            recipients, payout_error = build_seller_payout_callback(order_dict)
+            if payout_error:
+                logging.warning(f"Could not build seller payouts for order {oid[:8]}: {payout_error}. Sweeping to main address only.")
+                recipients = None
+            elif recipients:
+                logging.info(f"Built seller payouts for order {oid[:8]}: {len(recipients)} recipient(s)")
+        except Exception as e:
+            logging.warning(f"Error building seller payouts for order {oid[:8]}: {e}. Sweeping to main address only.")
+            recipients = None
+
         address_path = order_dict.get('address_path')
         if not address_path:
             address_path = find_address_path_by_address(DB_FILE, order_dict['ltc_address'], WALLET_SEED)
@@ -191,24 +221,38 @@ async def process_payment_delivery(order_dict, balance_info, bot_instance, updat
 
         if address_path:
             try:
-                recipients = None
-                if order_dict.get('status') == 'paid':
-                    # Build seller payout outputs for multi-seller orders
-                    recipients_result = build_seller_payout_callback(order_dict)
-                    if recipients_result[0]:
-                        recipients = recipients_result[0]
+                # Retry sweep operation up to 3 times with backoff
+                max_sweep_retries = 3
+                sweep_success = False
+                sweep_txid = None
 
-                sweep_success, sweep_txid = await sweep_payment(
-                    DB_FILE,
-                    address_path,
-                    order_dict['ltc_address'],
-                    Decimal(str(order_dict['price_ltc'])),
-                    WALLET_SEED,
-                    RECEIVING_ADDRESS,
-                    get_next_blockcypher_token(),
-                    LTC_CONFIRMATIONS,
-                    recipients=recipients,
-                )
+                for sweep_attempt in range(max_sweep_retries):
+                    try:
+                        sweep_success, sweep_txid = await sweep_payment(
+                            DB_FILE,
+                            address_path,
+                            order_dict['ltc_address'],
+                            Decimal(str(order_dict['price_ltc'])),
+                            WALLET_SEED,
+                            RECEIVING_ADDRESS,
+                            get_next_blockcypher_token(),
+                            LTC_CONFIRMATIONS,
+                            recipients=recipients,
+                        )
+                        if sweep_success:
+                            break
+                        elif sweep_attempt < max_sweep_retries - 1:
+                            wait_time = 2 ** sweep_attempt  # Exponential backoff: 1s, 2s, 4s
+                            logging.warning(f"Sweep attempt {sweep_attempt + 1} failed for order {oid[:8]}, retrying in {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                    except Exception as sweep_e:
+                        if sweep_attempt < max_sweep_retries - 1:
+                            wait_time = 2 ** sweep_attempt
+                            logging.warning(f"Sweep attempt {sweep_attempt + 1} failed for order {oid[:8]}: {sweep_e}, retrying in {wait_time}s...")
+                            await asyncio.sleep(wait_time)
+                        else:
+                            logging.error(f"All sweep attempts failed for order {oid[:8]}: {sweep_e}")
+                            raise sweep_e
 
                 now = datetime.now(timezone.utc).timestamp()
                 conn = get_db(DB_FILE)
@@ -265,8 +309,18 @@ async def process_payment_delivery(order_dict, balance_info, bot_instance, updat
         if user:
             product = get_product(product_id)
 
-            # Get delivered items
-            delivered_items = get_reserved_stock_callback(oid)
+            # Get delivered items (directly query since reservations removed)
+            conn = get_db(DB_FILE)
+            c = conn.cursor()
+            c.execute('''
+                SELECT si.*, uw.ltc_address
+                FROM stock_items si
+                LEFT JOIN user_wallets uw ON si.restocked_by = uw.user_id AND uw.is_active = 1
+                WHERE si.order_id = ? AND si.status = 'delivered'
+                ORDER BY si.created_at ASC
+            ''', (oid,))
+            delivered_items = [dict(row) for row in c.fetchall()]
+            conn.close()
 
             em = discord.Embed(
                 title="✅ Order Delivered!",

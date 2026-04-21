@@ -45,7 +45,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Import from modules
-from shopbot.database import init_db, get_db, get_product as _get_product, all_products as _all_products, get_order as _get_order, all_products_by_category as _all_products_by_category, get_categories as _get_categories, add_category as _add_category, all_orders as _all_orders, get_stock_items as _get_stock_items, log_audit as _log_audit, check_rate_limit as _check_rate_limit, hash_content, check_duplicate_stock as _check_duplicate_stock, get_user_wallet as _get_user_wallet, set_user_wallet as _set_user_wallet, remove_user_wallet as _remove_user_wallet, get_seller_revenue as _get_seller_revenue, record_payout as _record_payout, get_payout_history as _get_payout_history, reserve_stock_items as _reserve_stock_items, release_reserved_stock as _release_reserved_stock, get_reserved_stock_items_for_order as _get_reserved_stock_items_for_order, build_seller_payout_from_pending_stock as _build_seller_payout_from_pending_stock, assign_order_stock_to_order as _assign_order_stock_to_order
+from shopbot.database import init_db, get_db, get_product as _get_product, all_products as _all_products, get_order as _get_order, all_products_by_category as _all_products_by_category, get_categories as _get_categories, add_category as _add_category, all_orders as _all_orders, get_stock_items as _get_stock_items, log_audit as _log_audit, check_rate_limit as _check_rate_limit, hash_content, check_duplicate_stock as _check_duplicate_stock, get_user_wallet as _get_user_wallet, set_user_wallet as _set_user_wallet, remove_user_wallet as _remove_user_wallet, get_seller_revenue as _get_seller_revenue, record_payout as _record_payout, get_payout_history as _get_payout_history, build_seller_payout_from_pending_stock as _build_seller_payout_from_pending_stock, assign_order_stock_to_order as _assign_order_stock_to_order
 from shopbot.crypto import get_wallet_from_seed, get_payment_wallet, find_address_path_by_address, generate_ltc_address, get_address_balance, litoshi_to_ltc, format_ltc, fetch_ltc_usd_price, sweep_payment
 from shopbot.shop import get_stock_status, ShopPage
 from src.services.payment_engine import get_address_transactions, process_automatic_refund, process_payment_delivery
@@ -59,11 +59,12 @@ import src.commands.handlers as command_handlers
 from utils import (
     CONFIG, TOKEN, WALLET_SEED, PREFIX, ADMIN_ROLE_ID, SELLER_ROLE_ID,
     INVOICE_CHANNEL_ID, LOGGING_CHANNEL_ID, RECEIVING_ADDRESS, DB_FILE,
-    COLORS, STATUS_EMOJI, PAYMENT_TIMEOUT, RESERVATION_TIMEOUT, POLL_INTERVAL,
+    COLORS, STATUS_EMOJI, PAYMENT_TIMEOUT, POLL_INTERVAL,
     LTC_CONFIRMATIONS, RESTOCK_RATE_LIMIT, LOW_STOCK_THRESHOLD, MAX_SWEEP_ATTEMPTS,
     SWEEP_RETRY_BACKOFF, MAX_REFUND_ATTEMPTS, RESTOCKING_STATUS,
     get_expiration_footer, get_expiration_timestamp, get_order_expiration_footer, mask_wallet_address, format_usd,
     user_has_admin_or_seller_role, admin_check_interaction, seller_check_interaction,
+    owner_or_admin_check_interaction, is_owner_or_admin,
     get_next_blockcypher_token,
     WEBHOOK_HOST, WEBHOOK_PORT, WEBHOOK_BASE_URL, WEBHOOK_SECRET,
     admin_or_seller_check_interaction, is_admin, INVOICE_REFRESH_INTERVAL
@@ -76,7 +77,7 @@ from ui.embeds import (
     default_embed_data, product_to_builder_data,
 )
 from ui.views import PartialPaymentConfirmView, InvoiceApproveView, OrderCancelView, EmbedBuilderView, start_product_builder, ShopPage, StockItemPage, EmptyStockItemPage, ProductDetailView, ProductSelect, DashboardView, AdminPanelView, RestockView, PaginatedStockView, ManageItemView, RestockPageView, ItemActionView, RestockTriggerView, WalletView
-from ui.modals import ConfirmCancelModal, RefundModal, SingleFieldModal, ColorModal, AddFieldModal, ProductCreateModal, EditProductModal, DeleteProductModal, RestockProductModal, AuditProductModal, SetWalletModal, QuantityModal, BuyProductModal, EditItemModal
+from ui.modals import ConfirmCancelModal, RefundModal, SingleFieldModal, ColorModal, AddFieldModal, ProductCreateModal, EditProductModal, DeleteProductModal, ResetConfirmModal, RestockProductModal, AuditProductModal, SetWalletModal, QuantityModal, BuyProductModal, EditItemModal
 
 # Import database wrappers
 from src.database import *
@@ -130,11 +131,12 @@ def check_duplicate_stock(product_id: str, content_hash: str) -> bool:
 
 async def ensure_http_global_over() -> None:
     try:
-        if hasattr(bot, '_http') and hasattr(bot._http, '_global_over'):
-            if type(bot._http._global_over).__name__ == '_MissingSentinel':
-                bot._http._global_over = asyncio.Event()
-                bot._http._global_over.set()
-                logging.info("✅ Patched bot._http._global_over event for HTTP client")
+        http_client = getattr(bot, 'http', getattr(bot, '_http', None))
+        if http_client is not None and hasattr(http_client, '_global_over'):
+            if type(http_client._global_over).__name__ == '_MissingSentinel':
+                http_client._global_over = asyncio.Event()
+                http_client._global_over.set()
+                logging.info("✅ Patched bot.http._global_over event for HTTP client")
     except Exception as e:
         logging.debug(f"Could not ensure HTTP global over event: {e}")
 
@@ -244,7 +246,7 @@ def find_address_path_by_address(address: str) -> str | None:
         max_index = int(row[0]) if row[0] is not None else int(row[1] or 0)
     for index in range(max_index + 10):
         try:
-            child = root.subkey_for_path(f"m/0/{index}")
+            child = root / f"m/0/{index}"
             if child.address() == address:
                 return f"m/0/{index}"
         except Exception:
@@ -286,7 +288,7 @@ async def update_invoice_message(order: dict, balance_info: dict | None):
 async def refresh_invoice_message(order: dict):
     """Wrapper for order_manager.refresh_invoice_message"""
     from src.services.order_manager import refresh_invoice_message as _refresh_invoice_message
-    await _refresh_invoice_message(order, get_channel_by_id, get_product)
+    await _refresh_invoice_message(order, get_channel_by_id, get_product, get_address_balance, litoshi_to_ltc)
 
 
 def build_order_embed(order: dict, product: dict, format_ltc_callback=None) -> discord.Embed:
@@ -342,12 +344,12 @@ def get_stock_status(product_id: str) -> Tuple[int, str]:
 
 async def update_user_order_message(order: dict):
     """Wrapper for order_manager.update_user_order_message"""
-    from services.order_manager import update_user_order_message as _update_user_order_message
+    from src.services.order_manager import update_user_order_message as _update_user_order_message
     await _update_user_order_message(order, get_channel_by_id, get_product, bot, format_ltc)
 
 async def update_stock_message(product_id: str):
     """Wrapper for stock_manager.update_stock_message"""
-    from services.stock_manager import update_stock_message as _update_stock_message
+    from src.services.stock_manager import update_stock_message as _update_stock_message
     await _update_stock_message(product_id, bot)
 
 async def save_item_message_id(item_id: str, product_id: str, channel_id: int, message_id: int):
@@ -455,16 +457,17 @@ async def update_item_embed(item_id: str, product_id: str, new_content: str):
 
 async def find_existing_product_embed(product: dict, channel):
     """Wrapper for finding existing product embeds"""
-    return await find_existing_product_embed(product, channel, bot_user=bot.user)
+    from src.commands.handlers import find_existing_product_embed as _find_existing_product_embed
+    return await _find_existing_product_embed(product, channel, bot_user=bot.user)
 
 async def send_low_stock_alert(product_id: str):
     """Wrapper for stock_manager.send_low_stock_alert"""
-    from services.stock_manager import send_low_stock_alert as _send_low_stock_alert
+    from src.services.stock_manager import send_low_stock_alert as _send_low_stock_alert
     await _send_low_stock_alert(product_id, bot)
 
 async def notify_next_in_queue(product_id: str):
     """Wrapper for stock_manager.notify_next_in_queue"""
-    from services.stock_manager import notify_next_in_queue as _notify_next_in_queue
+    from src.services.stock_manager import notify_next_in_queue as _notify_next_in_queue
     await _notify_next_in_queue(product_id, bot, get_channel_by_id, update_stock_message, build_order_embed)
 
 # ─────────────────────────────────────────────
@@ -509,7 +512,7 @@ except Exception as e:
 #  RESTOCK COMMANDS
 # ─────────────────────────────────────────────
 @bot.command(name="restock")
-@is_admin()
+@is_owner_or_admin()
 async def prefix_restock(ctx, product_id: str = ""):
     await command_handlers.prefix_restock(ctx, product_id)
 
@@ -538,8 +541,7 @@ async def check_payments():
     await _check_payments(
         all_orders, _get_address_balance_wrapper, _get_addresses_balance_wrapper, litoshi_to_ltc,
         update_invoice_message, process_automatic_refund, process_payment_delivery,
-        release_reserved_stock, send_log_embed, get_reserved_stock_items_for_order,
-        build_seller_payout_outputs, bot
+        send_log_embed, build_seller_payout_outputs, notify_next_in_queue, bot
     )
 
 
@@ -585,11 +587,10 @@ async def _handle_blockcypher_webhook(request):
             address,
             bot,
             update_invoice_message,
+            refresh_order_message,
             process_automatic_refund,
             process_payment_delivery,
-            release_reserved_stock,
             send_log_embed,
-            get_reserved_stock_items_for_order,
             build_seller_payout_outputs,
         )
         return web.Response(status=200, text="processed" if processed else "no orders")
@@ -631,7 +632,8 @@ async def _restore_product_embeds_wrapper():
     from src.commands.handlers import restore_product_embeds as _restore_product_embeds
     return await _restore_product_embeds(
         get_channel_by_id_callback=get_channel_by_id,
-        find_existing_product_embed_callback=find_existing_product_embed
+        find_existing_product_embed_callback=find_existing_product_embed,
+        bot_instance=bot,
     )
 
 # ─────────────────────────────────────────────
@@ -825,37 +827,37 @@ async def _auto_refresh_wallet(message: discord.Message, user_id: str):
 @bot.command(name="dashboard")
 async def prefix_dashboard(ctx):
     """Wrapper for commands.prefix_dashboard"""
-    from commands import prefix_dashboard as _prefix_dashboard
+    from src.commands import prefix_dashboard as _prefix_dashboard
     await _prefix_dashboard(ctx, bot)
 
 @bot.tree.command(name="dashboard", description="View shop dashboard and browse products")
 async def slash_dashboard(interaction: discord.Interaction):
     """Wrapper for commands.slash_dashboard"""
-    from commands import slash_dashboard as _slash_dashboard
+    from src.commands import slash_dashboard as _slash_dashboard
     await _slash_dashboard(interaction)
 
 @bot.command(name="panel")
 async def prefix_panel(ctx):
     """Wrapper for commands.prefix_panel"""
-    from commands import prefix_panel as _prefix_panel
+    from src.commands import prefix_panel as _prefix_panel
     await _prefix_panel(ctx, bot)
 
 @bot.tree.command(name="panel", description="View admin panel")
 async def slash_panel(interaction: discord.Interaction):
     """Wrapper for commands.slash_panel"""
-    from commands import slash_panel as _slash_panel
+    from src.commands import slash_panel as _slash_panel
     await _slash_panel(interaction, bot)
 
 @bot.command(name="wallet")
 async def prefix_wallet(ctx):
     """Wrapper for commands.prefix_wallet"""
-    from commands import prefix_wallet as _prefix_wallet
+    from src.commands import prefix_wallet as _prefix_wallet
     await _prefix_wallet(ctx, bot)
 
 @bot.tree.command(name="wallet", description="Manage your linked LTC wallet")
 async def slash_wallet(interaction: discord.Interaction):
     """Wrapper for commands.slash_wallet"""
-    from commands import slash_wallet as _slash_wallet
+    from src.commands import slash_wallet as _slash_wallet
     await _slash_wallet(interaction, bot)
 
 # ─────────────────────────────────────────────
@@ -886,13 +888,13 @@ async def send_ltc_price(target):
 @bot.command(name="ltc")
 async def prefix_ltc(ctx):
     """Wrapper for commands.prefix_ltc"""
-    from commands import prefix_ltc as _prefix_ltc
+    from src.commands import prefix_ltc as _prefix_ltc
     await _prefix_ltc(ctx)
 
 @bot.tree.command(name="ltc", description="Check real-time LTC price in USD")
 async def slash_ltc(interaction: discord.Interaction):
     """Wrapper for commands.slash_ltc"""
-    from commands import slash_ltc as _slash_ltc
+    from src.commands import slash_ltc as _slash_ltc
     await _slash_ltc(interaction)
 
 # ─────────────────────────────────────────────
@@ -1307,38 +1309,38 @@ async def refresh_product_embed(product: dict, guild: discord.Guild | None = Non
         return False, None  # Any other error - skip silently
 
 @bot.command(name="analytics")
-@is_admin()
+@is_owner_or_admin()
 async def analytics_command(ctx, days: int = 7):
     await command_handlers.analytics_command(ctx, days)
 
 
 @bot.tree.command(name="analytics", description="[Admin] View sales analytics")
-@is_admin()
+@is_owner_or_admin()
 async def slash_analytics(interaction: discord.Interaction, days: int = 7):
     await interaction.response.defer(ephemeral=True)
     await analytics_command(interaction, days)
 
 
 @bot.command(name="dbhealth")
-@is_admin()
+@is_owner_or_admin()
 async def db_health_command(ctx):
     await command_handlers.db_health_command(ctx)
 
 
 @bot.tree.command(name="dbhealth", description="[Admin] Check database health")
-@is_admin()
+@is_owner_or_admin()
 async def slash_db_health(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await db_health_command(interaction)
 
 
 @bot.command(name="updateproduct")
-@is_admin()
+@is_owner_or_admin()
 async def prefix_updateproduct(ctx, product_id: str, field: str, value: str):
     await update_product_fields(ctx, product_id, field, value, refresh_product_embed)
 
 @bot.command(name="editproduct")
-@is_admin()
+@is_owner_or_admin()
 async def prefix_editproduct(ctx, product_id: str):
     await ctx.send(
         "❌ Prefix editproduct cannot open an ephemeral editor. Use `/editproduct {product_id}` instead.",
@@ -1356,7 +1358,7 @@ async def send_audit_log(target, product_id: str):
     await command_handlers.send_audit_log(target, product_id)
 
 @bot.command(name="audit")
-@is_admin()
+@is_owner_or_admin()
 async def prefix_audit(ctx, product_id: str = ""):
     if not product_id:
         await ctx.send("Usage: `!audit <product_id>`")
@@ -1383,7 +1385,7 @@ async def do_delete_product(target, product_id: str):
     await command_handlers.do_delete_product(target, product_id, get_channel_by_id)
 
 @bot.command(name="deleteproduct")
-@is_admin()
+@is_owner_or_admin()
 async def prefix_deleteproduct(ctx, product_id: str = ""):
     if not product_id:
         await ctx.send("Usage: `!deleteproduct <product_id>`")
@@ -1394,6 +1396,10 @@ async def prefix_deleteproduct(ctx, product_id: str = ""):
 @app_commands.describe(product_id="Product ID to remove")
 async def slash_deleteproduct(interaction: discord.Interaction, product_id: str):
     await do_delete_product(interaction, product_id)
+
+@bot.tree.command(name="reset", description="[OWNER] Reset entire database - DELETES ALL DATA")
+async def slash_reset(interaction: discord.Interaction):
+    await interaction.response.send_modal(ResetConfirmModal())
 
 # ─────────────────────────────────────────────
 #  ADMIN: MANUAL ORDER INSERT (DEBUG)
@@ -1410,7 +1416,7 @@ async def send_all_orders(target):
     await command_handlers.send_all_orders(target)
 
 @bot.command(name="allorders")
-@is_admin()
+@is_owner_or_admin()
 async def prefix_allorders(ctx):
     await send_all_orders(ctx)
 

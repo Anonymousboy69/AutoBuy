@@ -1,32 +1,33 @@
 {
   "bot": {
     "prefix": "!",
-    "admin_role": 1493058231210082326,
-    "seller_role": 1493388810468331653,
-    "invoice_channel_id": 1493058457232740382,
-    "logging_channel_id": 1493058511486062735
+    "owner_id": 1422856978283106398,
+    "admin_role": 1496100490428022804,
+    "seller_role": 1496100571529216012,
+    "invoice_channel_id": 1496100383360159764,
+    "logging_channel_id": 1496100679041679442
   },
   "crypto": {
-    "receiving_address": "ltc1qh5st48vcp6zazp8f9544s7pv0n6rlg60r32lje",
+    "receiving_address": "LfFRExQDy7LzvrDcAQpFsDyBATNSrdLh6W",
     "payment_timeout": 3600,
     "ltc_confirmations": 1,
-    "poll_interval": 300
-    ,
-    "reservation_timeout": 300
+    "poll_interval": 1800,
+    "webhook_primary": true,
+    "webhook_required": false
   },
   "database": {
     "file": "data/shop_data.db"
   },
   "shop": {
-    "restock_rate_limit": 10,
+    "restock_rate_limit": 50,
     "low_stock_threshold": 5,
     "platform_fee_percent": 0.0
   },
   "payouts": {
-    "enabled": false,
+    "enabled": true,
     "minimum_payout": 0.001,
     "auto_payout_threshold": 0.01,
-    "schedule": "manual",
+    "schedule": "auto",
     "batch_size": 5
   }
 }

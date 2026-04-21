@@ -27,6 +27,8 @@ COLORS = {
     "info":    0x3498DB,
 }
 
+from src.http_utils import ensure_http_client_ready
+
 # ─────────────────────────────────────────────
 #  STOCK HELPERS
 # ─────────────────────────────────────────────
@@ -62,6 +64,7 @@ async def update_stock_message(db_file: str, product_id: str, bot):
     try:
         channel = bot.get_channel(int(channel_id))
         if channel is None:
+            await ensure_http_client_ready(bot)
             channel = await bot.fetch_channel(int(channel_id))
         msg = await channel.fetch_message(int(embed_msg_id))
         if not msg.embeds:
@@ -131,10 +134,10 @@ async def notify_next_in_queue(db_file: str, product_id: str, bot):
     order_id, user_id, invoice_channel_id, invoice_message_id = queued_order
     
     try:
-        # Get user and channel
         user = await bot.fetch_user(int(user_id))
         channel = bot.get_channel(int(invoice_channel_id))
         if channel is None:
+            await ensure_http_client_ready(bot)
             channel = await bot.fetch_channel(int(invoice_channel_id))
         
         # Send notification
@@ -166,7 +169,6 @@ async def notify_next_in_queue(db_file: str, product_id: str, bot):
             if product.get("price_usd") is not None:
                 em_payment.add_field(name="USD Price", value=f"${product['price_usd']:.2f}", inline=True)
             em_payment.add_field(name="Order ID", value=f"`{order_id[:8]}`", inline=True)
-            em_payment.add_field(name="Blockchain", value="Litecoin", inline=True)
             em_payment.add_field(name="Payment Address", value=f"```{order['ltc_address']}```", inline=False)
             em_payment.set_footer(text="Expires in 1 hour")
             await user.send(embed=em_payment)

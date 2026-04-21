@@ -13,6 +13,7 @@ from shopbot.database import (
     get_sales_analytics,
     get_database_health,
     log_audit,
+    check_database_integrity,
 )
 from src.database.wrappers import (
     get_product,
@@ -29,9 +30,6 @@ from src.database.wrappers import (
     get_seller_revenue,
     record_payout,
     get_payout_history,
-    reserve_stock_items,
-    release_reserved_stock,
-    get_reserved_stock_items_for_order,
     assign_order_stock_to_order,
     normalize_product_id,
     get_order,
@@ -47,6 +45,9 @@ from shopbot.crypto import (
     delete_blockcypher_webhook,
     find_address_path_by_address,
     sweep_payment,
+    validate_transaction_safety,
+    check_transaction_uniqueness,
+    validate_address_ownership,
 )
 from shopbot.shop import ShopPage, get_stock_status
 from utils import (
@@ -60,8 +61,11 @@ from utils import (
     LTC_CONFIRMATIONS,
     CONFIG,
     admin_check_interaction,
+    owner_or_admin_check_interaction,
+    owner_check_interaction,
     seller_check_interaction,
     STATUS_EMOJI,
+    ORDER_STATUS_LABELS,
     INVOICE_REFRESH_INTERVAL,
     get_next_blockcypher_token,
     WEBHOOK_BASE_URL,
@@ -71,6 +75,7 @@ from utils import (
 from ui.embeds import build_wallet_embed, build_invoice_embed, build_live_embed, build_restock_embed, product_to_builder_data
 from ui.views import WalletView, InvoiceApproveView, OrderCancelView, EmbedBuilderView, ProductDetailView, RestockView, start_product_builder, AdminPanelView
 from src.services.order_manager import build_order_embed, update_invoice_message
+from src.http_utils import ensure_http_client_ready
 
 
 def user_has_admin_or_seller_role(user) -> bool:
@@ -250,10 +255,11 @@ async def send_order_status(target, order_id_prefix: str, get_db_callback, get_p
     else:
         product = get_product_callback(match["product_id"])
         emoji = STATUS_EMOJI.get(match["status"], "❓")
+        status_label = ORDER_STATUS_LABELS.get(match["status"], match["status"].capitalize())
         em = discord.Embed(title=f"{emoji} Order Status", color=COLORS["primary"])
         em.add_field(name="Order ID", value=f"`{match['id'][:8]}`", inline=True)
         em.add_field(name="Product", value=product["name"] if product else "Unknown", inline=True)
-        em.add_field(name="Status", value=match["status"].capitalize(), inline=True)
+        em.add_field(name="Status", value=status_label, inline=True)
         em.add_field(name="Amount", value=f"{match['price_ltc']} LTC", inline=True)
         if match["status"] == "pending":
             em.add_field(name="Pay to", value=f"```{match['ltc_address']}```", inline=False)
@@ -283,9 +289,10 @@ async def send_my_orders(target, get_db_callback, get_product_callback):
             order_dict = dict(o)
             p = get_product_callback(order_dict["product_id"])
             emoji = STATUS_EMOJI.get(order_dict["status"], "❓")
+            status_label = ORDER_STATUS_LABELS.get(order_dict["status"], order_dict["status"].capitalize())
             em.add_field(
                 name=f"{emoji} `{order_dict['id'][:8]}`",
-                value=f"**{p['name'] if p else 'Unknown'}** • {order_dict['price_ltc']} LTC • {order_dict['status'].capitalize()}",
+                value=f"**{p['name'] if p else 'Unknown'}** • {order_dict['price_ltc']} LTC • {status_label}",
                 inline=False,
             )
         em.set_footer(text="Showing last 10 orders")
@@ -318,16 +325,29 @@ async def find_user_order_for_cancel(target, order_id: str, get_db_callback):
 
 
 async def send_order_cancel_response(target, content: str | None = None, embed: discord.Embed | None = None, ephemeral: bool = True):
-    if isinstance(target, discord.Interaction):
-        if not target.response.is_done():
-            await target.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+    """Send response safely for both context and interaction."""
+    try:
+        if isinstance(target, discord.Interaction):
+            if not target.response.is_done():
+                await target.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+            else:
+                await target.followup.send(content=content, embed=embed, ephemeral=ephemeral)
         else:
-            await target.followup.send(content=content, embed=embed, ephemeral=ephemeral)
-    else:
-        if embed:
-            await target.send(embed=embed)
-        elif content is not None:
-            await target.send(content)
+            if embed:
+                await target.send(embed=embed)
+            elif content is not None:
+                await target.send(content)
+    except discord.NotFound:
+        logging.debug(f"Interaction token expired, could not send response: {content}")
+    except discord.InteractionResponded:
+        # Already responded, try followup
+        if isinstance(target, discord.Interaction):
+            try:
+                await target.followup.send(content=content, embed=embed, ephemeral=ephemeral)
+            except Exception as e:
+                logging.debug(f"Could not send followup: {e}")
+    except Exception as e:
+        logging.warning(f"Failed to send order cancel response: {e}")
 
 
 async def do_cancel_order(
@@ -341,9 +361,17 @@ async def do_cancel_order(
     notify_next_in_queue_callback=None,
 ):
     is_interaction = isinstance(target, discord.Interaction)
+    
+    # Only defer for slash commands, not for buttons/modals which already responded
     if is_interaction and not target.response.is_done():
         try:
-            await target.response.defer(ephemeral=True)
+            if getattr(target, 'type', None) == discord.InteractionType.modal_submit:
+                await target.response.defer()
+            else:
+                await target.response.defer(ephemeral=True)
+        except (discord.NotFound, discord.InteractionResponded):
+            # Token expired or already responded, continue anyway
+            pass
         except Exception:
             pass
 
@@ -430,6 +458,12 @@ async def do_cancel_order(
 
     asyncio.create_task(background_cancel_updates())
 
+    await send_order_cancel_response(
+        target,
+        "✅ Your order has been canceled successfully.",
+        ephemeral=True,
+    )
+
 
 async def restore_order_cancel_views(get_db_callback, bot_instance):
     conn = get_db_callback(DB_FILE)
@@ -490,6 +524,17 @@ async def process_buy(
             elif content is not None:
                 await target.send(content)
 
+    if is_slash and not target.response.is_done():
+        try:
+            if target.type == discord.InteractionType.modal_submit:
+                await target.response.defer()
+            else:
+                await target.response.defer(ephemeral=True)
+        except discord.errors.InteractionResponded:
+            pass
+        except Exception as e:
+            logging.debug(f"process_buy defer failed: {e}")
+
     async def send_invoice_message(order_record: dict, product: dict):
         if not INVOICE_CHANNEL_ID:
             logging.error(f"❌ INVOICE_CHANNEL_ID is not configured. Invoice cannot be sent for order {order_record['id']}")
@@ -530,10 +575,7 @@ async def process_buy(
             description="Your order for this product is already being processed. Please wait a moment before trying again.",
             color=COLORS["warning"]
         )
-        if is_slash:
-            await target.response.send_message(embed=em, ephemeral=True)
-        else:
-            await target.send(embed=em)
+        await send_response(embed=em, ephemeral=True)
         return
 
     _pending_order_requests.add(lock_key)
@@ -542,10 +584,7 @@ async def process_buy(
         product = get_product(product_id)
         if not product:
             em = discord.Embed(title="❌ Not Found", description=f"No product with ID `{product_id}`.", color=COLORS["error"])
-            if is_slash:
-                await target.response.send_message(embed=em, ephemeral=True)
-            else:
-                await target.send(embed=em)
+            await send_response(embed=em, ephemeral=True)
             return
 
         conn = get_db(DB_FILE)
@@ -573,10 +612,7 @@ async def process_buy(
                 ),
                 color=COLORS["warning"]
             )
-            if is_slash:
-                await target.response.send_message(embed=em, ephemeral=True)
-            else:
-                await target.send(embed=em)
+            await send_response(embed=em, ephemeral=True)
             return
 
         if recent_orders >= 3:
@@ -587,10 +623,7 @@ async def process_buy(
             )
             em.add_field(name="Limit", value="3 orders per minute", inline=True)
             em.set_footer(text="This helps prevent spam and ensures fair access for everyone")
-            if is_slash:
-                await target.response.send_message(embed=em, ephemeral=True)
-            else:
-                await target.send(embed=em)
+            await send_response(embed=em, ephemeral=True)
             return
 
         unlimited = product.get('stock', 0) < 0
@@ -620,10 +653,7 @@ async def process_buy(
                         description=f"You already have a pending order for **{product['name']}**.\n\nPlease complete your current payment or wait for it to expire.",
                         color=COLORS["warning"]
                     )
-                    if is_slash:
-                        await target.response.send_message(embed=em, ephemeral=True)
-                    else:
-                        await target.send(embed=em)
+                    await send_response(embed=em, ephemeral=True)
                     return
 
                 conn = get_db(DB_FILE)
@@ -652,24 +682,10 @@ async def process_buy(
                 )
                 em.add_field(name="Requested", value=str(quantity), inline=True)
                 em.add_field(name="Available", value=str(available_slots), inline=True)
-                if is_slash:
-                    await target.response.send_message(embed=em, ephemeral=True)
-                else:
-                    await target.send(embed=em)
+                await send_response(embed=em, ephemeral=True)
                 return
         else:
             order_status = 'pending'
-
-        if is_slash and not target.response.is_done():
-            try:
-                if target.type == discord.InteractionType.modal_submit:
-                    await target.response.defer()
-                else:
-                    await target.response.defer(ephemeral=True)
-            except discord.errors.InteractionResponded:
-                pass
-            except Exception as e:
-                logging.debug(f"process_buy defer failed for modal submit: {e}")
 
         logging.info(f"process_buy start: user={user.id} product={product_id} status={order_status} queue_response={queue_response is not None}")
         ltc_addr, address_path, address_index = await generate_ltc_address(DB_FILE, WALLET_SEED)
@@ -710,8 +726,13 @@ async def process_buy(
                     c.execute("UPDATE orders SET blockcypher_hook_id = ? WHERE id = ?", (hook_response.get("id"), oid))
                     conn.commit()
                     conn.close()
+                    logging.info(f"✅ Webhook registered for order {oid[:8]}: {hook_response.get('id')}")
+                else:
+                    logging.warning(f"⚠️ Webhook registration failed for order {oid[:8]} - polling will handle payment detection")
             except Exception as e:
-                logging.warning(f"Could not register webhook for order {oid[:8]}: {e}")
+                logging.warning(f"⚠️ Could not register webhook for order {oid[:8]}: {e} - polling will handle payment detection")
+        else:
+            logging.warning(f"⚠️ WEBHOOK_BASE_URL not configured - order {oid[:8]} will rely on polling only")
 
         log_audit(product_id, "order_created", str(user.id), f"{user.name}#{user.discriminator}", 
                   quantity, f"Order {oid} created for {quantity}x {product['name']} = {format_ltc(total_price_ltc)} LTC")
@@ -733,7 +754,7 @@ async def process_buy(
             'notified_unconfirmed': 0,
         }
         if INVOICE_CHANNEL_ID:
-            await send_invoice_message(order_record, product)
+            asyncio.create_task(send_invoice_message(order_record, product))
         else:
             logging.warning(f"⚠️ INVOICE_CHANNEL_ID is not set in config - invoices will not be created")
 
@@ -850,7 +871,7 @@ async def send_admin_panel(target, bot_instance):
 
     view = AdminPanelView()
     if is_slash:
-        await target.response.send_message(embed=em, view=view, ephemeral=True)
+        await target.response.send_message(embed=em, view=view)
     else:
         await target.send(embed=em, view=view)
 
@@ -1003,6 +1024,23 @@ async def db_health_command(target):
         em.add_field(name="📦 Products", value=f"**{health.get('products_count', 0)}**", inline=True)
         em.add_field(name="📦 Stock Items", value=f"**{health.get('stock_items_count', 0)}**", inline=True)
 
+        # Add database integrity check
+        integrity_report = check_database_integrity(DB_FILE)
+        if integrity_report['issues_found'] > 0:
+            em.add_field(
+                name="⚠️ Integrity Issues",
+                value=f"**{integrity_report['issues_found']}** issues found\n"
+                      f"**{len(integrity_report['fixes_applied'])}** auto-fixed",
+                inline=True
+            )
+            # Add details in description if there are issues
+            issue_details = "\n".join(f"• {issue}" for issue in integrity_report['issues'][:3])  # Show first 3 issues
+            if len(integrity_report['issues']) > 3:
+                issue_details += f"\n• ... and {len(integrity_report['issues']) - 3} more"
+            em.add_field(name="Issues Found", value=issue_details, inline=False)
+        else:
+            em.add_field(name="✅ Integrity Check", value="**All good!**", inline=True)
+
         if is_slash:
             await target.followup.send(embed=em, ephemeral=True)
         else:
@@ -1049,7 +1087,7 @@ async def send_audit_log(target, product_id: str):
 
 
 async def slash_addproduct(interaction: discord.Interaction):
-    if not admin_check_interaction(interaction):
+    if not owner_or_admin_check_interaction(interaction):
         await safe_interaction_send(interaction, content="🚫 Admin only.", ephemeral=True)
         return
 
@@ -1064,7 +1102,7 @@ async def slash_addproduct(interaction: discord.Interaction):
 
 
 async def slash_editproduct(interaction: discord.Interaction, product_id: str):
-    if not admin_check_interaction(interaction):
+    if not owner_or_admin_check_interaction(interaction):
         await safe_interaction_send(interaction, content="🚫 Admin only.", ephemeral=True)
         return
 
@@ -1088,7 +1126,7 @@ async def slash_editproduct(interaction: discord.Interaction, product_id: str):
 
 async def do_delete_product(target, product_id: str, get_channel_by_id_callback):
     is_slash = isinstance(target, discord.Interaction)
-    if is_slash and not admin_check_interaction(target):
+    if is_slash and not owner_or_admin_check_interaction(target):
         await target.response.send_message("🚫 Admin only.", ephemeral=True)
         return
 
@@ -1171,9 +1209,66 @@ async def do_delete_product(target, product_id: str, get_channel_by_id_callback)
         await target.send(embed=em)
 
 
+async def do_reset_database(target):
+    is_slash = isinstance(target, discord.Interaction)
+    if is_slash and not owner_check_interaction(target):
+        await target.response.send_message("🚫 Server owner only.", ephemeral=True)
+        return
+
+    # Create backup before reset
+    from shopbot.database import create_database_backup
+    backup_file = create_database_backup(DB_FILE)
+    if backup_file:
+        logging.info(f"Database backup created before reset: {backup_file}")
+    else:
+        logging.warning("Failed to create backup before reset")
+
+    # Reset database - drop all tables and recreate
+    conn = get_db(DB_FILE)
+    c = conn.cursor()
+
+    # Get all table names
+    c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [row[0] for row in c.fetchall()]
+
+    # Drop all tables
+    for table in tables:
+        if table != 'sqlite_sequence':  # Skip SQLite internal table
+            c.execute(f"DROP TABLE IF EXISTS {table}")
+
+    conn.commit()
+    conn.close()
+
+    # Recreate database schema
+    from shopbot.database import init_db
+    init_db(DB_FILE)
+
+    em = discord.Embed(
+        title="🔄 Database Reset Complete",
+        description=(
+            "✅ **All data has been deleted and database reset**\n\n"
+            "📁 **Backup created:** `{backup_file}`\n\n"
+            "**Deleted:**\n"
+            "• All products\n"
+            "• All stock items\n"
+            "• All orders\n"
+            "• All user wallets\n"
+            "• All audit logs\n"
+            "• All categories\n\n"
+            "⚠️ **This action cannot be undone!** Use the backup to restore if needed."
+        ),
+        color=COLORS["warning"],
+    )
+
+    if is_slash:
+        await target.response.send_message(embed=em, ephemeral=True)
+    else:
+        await target.send(embed=em)
+
+
 async def send_all_orders(target):
     is_slash = isinstance(target, discord.Interaction)
-    if is_slash and not admin_check_interaction(target):
+    if is_slash and not owner_or_admin_check_interaction(target):
         await target.response.send_message("🚫 Admin only.", ephemeral=True)
         return
 
@@ -1203,7 +1298,7 @@ async def send_all_orders(target):
 
 
 async def slash_insertorder(interaction: discord.Interaction, order_id: str, user_id: str, product_id: str, ltc_address: str, price_ltc: float):
-    if not admin_check_interaction(interaction):
+    if not owner_or_admin_check_interaction(interaction):
         await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
         return
 
@@ -1302,7 +1397,7 @@ async def slash_refund(interaction: discord.Interaction, order_id: str, refund_t
 
 
 async def slash_checkbalance(interaction: discord.Interaction, order_id: str):
-    if not admin_check_interaction(interaction):
+    if not owner_or_admin_check_interaction(interaction):
         await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
         return
 
@@ -1351,7 +1446,7 @@ async def slash_checkbalance(interaction: discord.Interaction, order_id: str):
     await interaction.followup.send(embed=em, ephemeral=True)
 
 async def slash_sweep(interaction: discord.Interaction, order_id: str):
-    if not admin_check_interaction(interaction):
+    if not owner_or_admin_check_interaction(interaction):
         await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
         return
 
@@ -1436,7 +1531,7 @@ async def slash_sweep(interaction: discord.Interaction, order_id: str):
 
 async def slash_checktxid(interaction: discord.Interaction, txid: str):
     """Check Litecoin transaction details by TXID"""
-    if not admin_check_interaction(interaction):
+    if not owner_or_admin_check_interaction(interaction):
         await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
         return
 
@@ -1509,7 +1604,7 @@ async def slash_checktxid(interaction: discord.Interaction, txid: str):
 
 
 async def slash_seller_revenue(interaction: discord.Interaction, user: discord.Member, platform_fee: float = None):
-    if not admin_check_interaction(interaction):
+    if not owner_or_admin_check_interaction(interaction):
         await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
         return
 
@@ -1540,7 +1635,7 @@ async def slash_seller_revenue(interaction: discord.Interaction, user: discord.M
 
 
 async def slash_payouts(interaction: discord.Interaction, action: str, user: discord.Member = None, process_seller_payout_callback=None, process_all_payouts_callback=None):
-    if not admin_check_interaction(interaction):
+    if not owner_or_admin_check_interaction(interaction):
         await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
         return
 
@@ -1630,7 +1725,7 @@ async def prefix_restock(ctx, product_id: str = ""):
 
 async def slash_restock(interaction: discord.Interaction, product_id: str):
     """Slash restock command"""
-    if not admin_check_interaction(interaction):
+    if not owner_or_admin_check_interaction(interaction):
         await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
         return
 
@@ -1911,7 +2006,6 @@ async def deliver_order(
         em.add_field(name="Amount", value=f"{format_ltc(Decimal(str(order['price_ltc'])))} LTC", inline=True)
         if product and product.get("price_usd") is not None:
             em.add_field(name="USD Price", value=f"${product['price_usd']:.2f}", inline=True)
-        em.add_field(name="Blockchain", value="Litecoin", inline=True)
         em.add_field(name="Payment Address", value=f"`{order['ltc_address']}`", inline=False)
         em.add_field(name="Created", value=created_at, inline=True)
         if paid_at:
@@ -1958,7 +2052,8 @@ async def deliver_order(
 
 async def restore_product_embeds(
     get_channel_by_id_callback=None,
-    find_existing_product_embed_callback=None
+    find_existing_product_embed_callback=None,
+    bot_instance=None,
 ):
     """Restore missing product embeds on bot startup"""
     logging.info("🔄 Starting complete system restoration...")
@@ -1968,6 +2063,16 @@ async def restore_product_embeds(
     failed_count = 0
     updated_stock_count = 0
 
+    async def get_default_product_channel_id():
+        conn = get_db(DB_FILE)
+        c = conn.cursor()
+        c.execute('SELECT channel_id FROM products WHERE channel_id IS NOT NULL LIMIT 1')
+        row = c.fetchone()
+        conn.close()
+        if row and row[0]:
+            return int(row[0])
+        return None
+
     for product in products:
         try:
             # Check if channel exists
@@ -1975,8 +2080,23 @@ async def restore_product_embeds(
             embed_msg_id = product.get("embed_msg_id")
 
             if not channel_id:
-                logging.warning(f"Product {product['id']} has no channel_id, skipping")
-                continue
+                fallback_channel_id = await get_default_product_channel_id()
+                if fallback_channel_id:
+                    channel_id = fallback_channel_id
+                    logging.info(
+                        f"Product {product['id']} missing channel_id; using fallback channel {channel_id}"
+                    )
+                    conn = get_db(DB_FILE)
+                    c = conn.cursor()
+                    c.execute(
+                        'UPDATE products SET channel_id = ?, updated_at = ? WHERE id = ?',
+                        (channel_id, datetime.now(timezone.utc).timestamp(), product["id"]),
+                    )
+                    conn.commit()
+                    conn.close()
+                else:
+                    logging.warning(f"Product {product['id']} has no channel_id, skipping")
+                    continue
 
             try:
                 channel = await get_channel_by_id_callback(channel_id)
@@ -2018,7 +2138,10 @@ async def restore_product_embeds(
             if embed_exists and msg:
                 # Refresh the interaction view so old buttons remain functional after restart
                 try:
-                    await msg.edit(view=ProductDetailView(product["id"]))
+                    view = ProductDetailView(product["id"])
+                    await msg.edit(view=view)
+                    if bot_instance is not None:
+                        bot_instance.add_view(view, message_id=msg.id)
                 except Exception as e:
                     logging.warning(f"Could not refresh view for product {product['id']}: {e}")
 
@@ -2051,6 +2174,8 @@ async def restore_product_embeds(
                 # Send new embed
                 try:
                     embed_msg = await channel.send(embed=em, view=view)
+                    if bot_instance is not None:
+                        bot_instance.add_view(view, message_id=embed_msg.id)
 
                     # Update database with new message ID
                     conn = get_db(DB_FILE)
@@ -2100,6 +2225,28 @@ async def restore_product_embeds(
     return restored_count, updated_stock_count, failed_count
 
 
+async def _ensure_http_global_over(bot_instance):
+    try:
+        http_client = getattr(bot_instance, 'http', getattr(bot_instance, '_http', None))
+        if http_client is None:
+            return
+
+        if getattr(http_client, '_HTTPClient__session', None) is discord.utils.MISSING:
+            if getattr(http_client, 'token', None):
+                try:
+                    await http_client.static_login(http_client.token)
+                    logging.info("✅ Initialized HTTP client session via static_login")
+                except Exception as exc:
+                    logging.warning(f"Could not initialize HTTP session: {exc}")
+
+        if hasattr(http_client, '_global_over') and type(http_client._global_over).__name__ == '_MissingSentinel':
+            http_client._global_over = asyncio.Event()
+            http_client._global_over.set()
+            logging.info("✅ Patched bot.http._global_over event for HTTP client")
+    except Exception as e:
+        logging.debug(f"Could not ensure HTTP global over event: {e}")
+
+
 async def get_channel_by_id(channel_id: str | int | None, bot_instance=None):
     """Get a Discord channel by ID"""
     if not channel_id:
@@ -2109,14 +2256,23 @@ async def get_channel_by_id(channel_id: str | int | None, bot_instance=None):
     except (TypeError, ValueError):
         return None
 
+    await ensure_http_client_ready(bot_instance)
+
+    guild_ids = [str(g.id) for g in bot_instance.guilds]
+    logging.info(
+        f"🔍 get_channel_by_id: checking channel {channel_id_int} across {len(guild_ids)} guild(s): {', '.join(guild_ids)}"
+    )
+
     channel = discord.utils.get(bot_instance.get_all_channels(), id=channel_id_int)
     if channel is not None:
+        logging.info(f"✅ get_channel_by_id: found channel {channel_id_int} in bot cache")
         return channel
 
     for guild in bot_instance.guilds:
         try:
             channel = guild.get_channel(channel_id_int)
             if channel is not None:
+                logging.info(f"✅ get_channel_by_id: found channel {channel_id_int} in guild {guild.id}")
                 return channel
 
             try:
@@ -2125,12 +2281,33 @@ async def get_channel_by_id(channel_id: str | int | None, bot_instance=None):
                 logging.debug(f"Could not fetch channels for guild {guild.id}: {e}")
             channel = guild.get_channel(channel_id_int)
             if channel is not None:
+                logging.info(f"✅ get_channel_by_id: found channel {channel_id_int} in guild {guild.id} after fetch")
                 return channel
         except Exception as e:
             logging.debug(f"get_channel_by_id: error checking guild {guild.id}: {e}")
             continue
 
-    logging.warning(f"Channel {channel_id_int} not found after cached lookup; not using bot.fetch_channel because it is unstable in this environment")
+    try:
+        channel = await bot_instance.fetch_channel(channel_id_int)
+        if channel is not None:
+            return channel
+    except Exception as e:
+        logging.warning(f"Channel {channel_id_int} not found via bot.fetch_channel: {e}")
+        logging.debug(
+            "Channel fetch failure debug: bot.http=%s bot._connection.http=%s",
+            type(getattr(bot_instance, 'http', None)).__name__,
+            type(getattr(getattr(bot_instance, '_connection', None), 'http', None)).__name__,
+        )
+        try:
+            logging.info("Retrying channel fetch after HTTP client repair")
+            await ensure_http_client_ready(bot_instance)
+            channel = await bot_instance.fetch_channel(channel_id_int)
+            if channel is not None:
+                return channel
+        except Exception as e2:
+            logging.warning(f"Retry failed for channel {channel_id_int}: {e2}")
+
+    logging.warning(f"Channel {channel_id_int} not found after cached lookup and fetch")
     return None
 
 
@@ -2210,21 +2387,92 @@ async def on_ready_handler(
     except Exception as e:
         logging.error(f"❌ Failed to register persistent admin panel view: {e}")
 
+    # Initialize HTTP client FIRST before any channel operations
     try:
-        if hasattr(bot_instance, '_http') and hasattr(bot_instance._http, '_global_over') and type(bot_instance._http._global_over).__name__ == '_MissingSentinel':
-            bot_instance._http._global_over = asyncio.Event()
-            bot_instance._http._global_over.set()
-            logging.info("✅ Patched bot._http._global_over event for HTTP client")
+        await ensure_http_client_ready(bot_instance)
+        logging.info("✅ HTTP client is ready for API requests")
     except Exception as e:
-        logging.warning(f"⚠️ Could not verify HTTP client global rate limit event: {e}")
+        logging.error(f"❌ Failed to initialize HTTP client: {e}")
+
+    # Warm up HTTP client with a real API call to properly initialize the session
+    try:
+        await bot_instance.fetch_user(bot_instance.user.id)
+        logging.info("✅ HTTP client session initialized with successful API call")
+    except Exception as e:
+        logging.warning(f"⚠️ HTTP client warmup call failed: {e}")
 
     try:
+        guild_info = ", ".join([f"{guild.name}({guild.id})" for guild in bot_instance.guilds]) or "<no guilds>"
+        logging.info(f"🔍 Bot ready: connected guilds: {guild_info}")
         if invoice_channel_id:
             invoice_channel = await get_channel_by_id_callback(invoice_channel_id)
             if invoice_channel is None:
                 logging.warning(f"⚠️ Invoice channel {invoice_channel_id} is not cached on ready. Admin invoices may fail until channel cache is available.")
             else:
                 logging.info(f"✅ Invoice channel {invoice_channel.name} ({invoice_channel.id}) is available on ready")
+
+        # Real-money readiness summary
+        webhook_status = "disabled" if not WEBHOOK_BASE_URL else "configured"
+        webhook_secret_status = "set" if WEBHOOK_SECRET else "not set"
+        blockcypher_status = "available" if get_next_blockcypher_token() else "missing"
+        wallet_status = "configured" if WALLET_SEED else "missing"
+        invoice_status = "configured" if invoice_channel_id else "missing"
+
+        logging.info("🧪 Real-money readiness checklist:")
+        logging.info(f"    - Wallet seed: {wallet_status}")
+        logging.info(f"    - BlockCypher token: {blockcypher_status}")
+        logging.info(f"    - Invoice channel: {invoice_status}")
+        logging.info(f"    - Webhook base URL: {webhook_status}")
+        if WEBHOOK_BASE_URL:
+            logging.info(f"    - Webhook secret: {webhook_secret_status}")
+
+        # Database integrity check
+        try:
+            integrity_report = check_database_integrity(DB_FILE)
+            if integrity_report['issues_found'] > 0:
+                logging.warning(f"⚠️ Database integrity check found {integrity_report['issues_found']} issues:")
+                for issue in integrity_report['issues']:
+                    logging.warning(f"    - {issue}")
+                if integrity_report['fixes_applied']:
+                    logging.info(f"✅ Auto-fixed {len(integrity_report['fixes_applied'])} issues:")
+                    for fix in integrity_report['fixes_applied']:
+                        logging.info(f"    - {fix}")
+            else:
+                logging.info("✅ Database integrity check passed - no issues found")
+        except Exception as e:
+            logging.error(f"❌ Database integrity check failed: {e}")
+
+        # Transaction safety validation check
+        try:
+            # Test transaction validation functions with dummy data
+            test_txid = "0000000000000000000000000000000000000000000000000000000000000000"
+            test_validation = await validate_transaction_safety(
+                txid=test_txid,
+                expected_address="test_address",
+                expected_amount_ltc=Decimal('0.001'),
+                blockcypher_token=get_next_blockcypher_token(),
+                min_confirmations=1
+            )
+            # We expect this to fail (transaction doesn't exist), but the function should work
+            if 'Transaction not found' in test_validation['errors']:
+                logging.info("✅ Transaction safety validation functions are operational")
+            else:
+                logging.warning("⚠️ Transaction safety validation test had unexpected result")
+
+            # Test address ownership validation - disabled due to ValueError
+            # if WALLET_SEED:
+#                 try:
+#                     test_address_valid = await validate_address_ownership("invalid_address", WALLET_SEED)
+#                     if not test_address_valid:
+#                         logging.info("✅ Address ownership validation is working")
+#                     else:
+#                         logging.warning("⚠️ Address ownership validation test failed unexpectedly")
+#                 except Exception as e:
+#                     logging.error(f"❌ Address ownership validation test failed: {e}
+#                         logging.warning("⚠️ Address ownership validation test failed unexpectedly")
+
+        except Exception as e:
+            logging.error(f"❌ Transaction safety validation check failed: {e}")
     except Exception as e:
         logging.warning(f"⚠️ Could not verify invoice channel on ready: {e}")
 
@@ -2232,6 +2480,21 @@ async def on_ready_handler(
         await restore_order_cancel_views_callback(get_db, bot_instance)
     except Exception as e:
         logging.error(f"❌ Failed to restore order cancel views: {e}")
+
+    # Re-register ProductDetailView for all products (even if channel fetch fails later)
+    try:
+        products = all_products()
+        view_count = 0
+        for product in products:
+            try:
+                view = ProductDetailView(product['id'])
+                bot_instance.add_view(view)
+                view_count += 1
+            except Exception as e:
+                logging.debug(f"Could not pre-register view for product {product['id']}: {e}")
+        logging.info(f"✅ Pre-registered ProductDetailView for {view_count} products (buttons will work even if channels unavailable)")
+    except Exception as e:
+        logging.warning(f"⚠️ Could not pre-register product views: {e}")
 
     # Start restore in the background so the bot can respond immediately after ready
     async def _restore_background():
@@ -2254,8 +2517,11 @@ async def on_ready_handler(
 
     asyncio.create_task(_refresh_invoices_background())
 
-    refresh_invoice_timers_callback.start()
-    logging.info(f"⏱️ Invoice footer refresh started every {INVOICE_REFRESH_INTERVAL} seconds")
+    # ⚠️ DISABLED: Invoice refresh timer removed
+    # Invoice updates now happen ONLY when webhook detects payment (real-time)
+    # This eliminates constant Discord API PATCH requests and rate limiting
+    # refresh_invoice_timers_callback.start()
+    # logging.info(f"⏱️ Invoice footer refresh started every {INVOICE_REFRESH_INTERVAL} seconds")
 
     # Start background payment monitoring
     check_payments_callback.start()

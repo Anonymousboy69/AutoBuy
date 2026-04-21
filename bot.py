@@ -12,7 +12,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 # Import and run the bot
-from bot import bot
+from src.bot import bot
 
 if __name__ == "__main__":
     print("[*] Starting Discord Shop Bot...")

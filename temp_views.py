@@ -42,7 +42,7 @@ class RestockView(discord.ui.View):
     async def done(self, interaction: discord.Interaction, button: discord.ui.Button):
         conn = get_db(DB_FILE)
         c = conn.cursor()
-        if admin_check_interaction(interaction):
+        if owner_or_admin_check_interaction(interaction):
             c.execute("UPDATE stock_items SET status = ? WHERE product_id = ? AND status = ?", ("pending", self.product_id, RESTOCKING_STATUS))
         else:
             seller_id = str(interaction.user.id)

@@ -15,7 +15,7 @@ from shopbot.crypto import litoshi_to_ltc, format_ltc
 from utils import (
     CONFIG, DB_FILE, COLORS, PAYMENT_TIMEOUT, LTC_CONFIRMATIONS, RESTOCKING_STATUS,
     mask_wallet_address, format_usd, ADMIN_ROLE_ID, SELLER_ROLE_ID,
-    get_expiration_footer, get_expiration_timestamp,
+    get_expiration_footer, get_expiration_timestamp, RECEIVING_ADDRESS,
 )
 
 
@@ -317,8 +317,6 @@ def build_invoice_embed(order: dict, product: dict, balance_info: dict | None = 
     em.add_field(name='Buyer', value=f"<@{order['user_id']}>" if order['user_id'] else 'Unknown', inline=True)
     em.add_field(name='Product', value=product['name'] if product else 'Unknown', inline=True)
     em.add_field(name='Status', value=status, inline=True)
-    em.add_field(name="Blockchain", value="Litecoin", inline=True)
-
     em.add_field(name='Quantity', value=str(order.get('quantity', 1)), inline=True)
     em.add_field(name='Amount', value=f"{format_ltc(expected)} LTC", inline=True)
     if product and product.get('price_usd') is not None:
@@ -339,16 +337,6 @@ def build_invoice_embed(order: dict, product: dict, balance_info: dict | None = 
         if order.get('ltc_address') and (confirmed > 0 or unconfirmed > 0):
             explorer_url = f"https://live.blockcypher.com/ltc/address/{order['ltc_address']}"
             em.add_field(name='🔗 Blockchain Explorer', value=f"[View Address]({explorer_url})", inline=False)
-            if transactions:
-                tx_links = []
-                for tx in transactions[:5]:
-                    tx_hash = tx.get('tx_hash') or tx.get('hash')
-                    if tx_hash:
-                        tx_links.append(f"[Tx {tx_hash[:8]}](https://live.blockcypher.com/ltc/tx/{tx_hash})")
-                if tx_links:
-                    if len(transactions) > 5:
-                        tx_links.append(f"...and {len(transactions) - 5} more")
-                    em.add_field(name='🧾 Recent Txns', value=' '.join(tx_links), inline=False)
 
     em.add_field(name='Confirmed', value=f"{format_ltc(confirmed)} LTC", inline=True)
     em.add_field(name='Unconfirmed', value=f"{format_ltc(unconfirmed)} LTC", inline=True)
@@ -357,8 +345,6 @@ def build_invoice_embed(order: dict, product: dict, balance_info: dict | None = 
         em.add_field(name='Remaining', value=f"{format_ltc(remaining)} LTC", inline=True)
     if confirmed > expected:
         em.add_field(name='Overpaid', value=f"{format_ltc(confirmed - expected)} LTC", inline=True)
-    if not show_payment_info:
-        em.add_field(name='Note', value='This order was canceled before payment. No blockchain payment is expected.', inline=False)
 
     em.add_field(name='Created', value=created_at, inline=False)
 
@@ -370,6 +356,12 @@ def build_invoice_embed(order: dict, product: dict, balance_info: dict | None = 
         if order.get('sweep_txid'):
             sweep_tx_url = f"https://live.blockcypher.com/ltc/tx/{order['sweep_txid']}"
             em.add_field(name='💸 Sweep Transaction', value=f"[View Sweep Tx]({sweep_tx_url})", inline=False)
+        
+        # Show receiving address where funds were swept to
+        if RECEIVING_ADDRESS and order['status'] == 'delivered':
+            em.add_field(name='Funds Received At', value=f"```{RECEIVING_ADDRESS}```", inline=False)
+            explorer_url = f"https://live.blockcypher.com/ltc/address/{RECEIVING_ADDRESS}"
+            em.add_field(name='🔗 Receiving Address Explorer', value=f"[View Address]({explorer_url})", inline=False)
 
     footer_text = 'Live invoice tracking — updates automatically as payment arrives.'
     if order['status'] == 'pending':

@@ -20,7 +20,10 @@ PARAGRAPH_FIELDS = {"description", "delivery"} | URL_FIELDS
 
 
 def _get_bot_module():
-    return importlib.import_module('bot')
+    try:
+        return importlib.import_module('src.bot')
+    except ModuleNotFoundError:
+        return importlib.import_module('bot')
 
 
 class SingleFieldModal(discord.ui.Modal):
@@ -498,6 +501,7 @@ class QuantityModal(discord.ui.Modal, title="Select Quantity"):
         self.product_id = product_id
 
     async def on_submit(self, interaction: discord.Interaction):
+        logging.info(f"QuantityModal submitted for product {self.product_id} user={interaction.user.id}")
         if self.confirm_text.value.strip().upper() != "BUY":
             await interaction.response.send_message(
                 "❌ Please type BUY to confirm.", ephemeral=True
@@ -534,8 +538,38 @@ class QuantityModal(discord.ui.Modal, title="Select Quantity"):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.defer(ephemeral=True)
+            except Exception as e:
+                logging.debug(f"QuantityModal defer failed: {e}")
+
         bot_mod = _get_bot_module()
+        # Repair HTTP client before processing buy
+        from src.http_utils import ensure_http_client_ready
+        await ensure_http_client_ready(interaction.client)
+        logging.info(f"Calling process_buy for product {self.product_id} with quantity {quantity}")
         await bot_mod.process_buy(interaction, self.product_id, quantity)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logging.error(f"[✗] QuantityModal.on_error: {error}")
+        import traceback; traceback.print_exc()
+        if not interaction.response.is_done():
+            try:
+                await interaction.response.send_message(
+                    "❌ Something went wrong while processing your order. Please try again.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await interaction.followup.send(
+                    "❌ Something went wrong while processing your order. Please try again.",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
 
 
 class BuyProductModal(discord.ui.Modal, title="Buy Product"):
@@ -672,6 +706,30 @@ class DeleteProductModal(discord.ui.Modal, title="Delete Product"):
         await bot_mod.do_delete_product(interaction, self.product_id.value.strip())
 
 
+class ResetConfirmModal(discord.ui.Modal, title="⚠️ CONFIRM DATABASE RESET"):
+    confirmation = discord.ui.TextInput(
+        label="Type 'RESET ALL DATA' to confirm",
+        placeholder="This will delete EVERYTHING permanently",
+        required=True,
+        max_length=20,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Import the owner check function
+        from utils.constants import owner_check_interaction
+        
+        if not owner_check_interaction(interaction):
+            await interaction.response.send_message("🚫 Owner only.", ephemeral=True)
+            return
+
+        if self.confirmation.value.strip() != "RESET ALL DATA":
+            await interaction.response.send_message("❌ Incorrect confirmation text. Reset cancelled.", ephemeral=True)
+            return
+
+        bot_mod = _get_bot_module()
+        await bot_mod.do_reset_database(interaction)
+
+
 class RestockModal(discord.ui.Modal, title="Restock Single Item"):
     content = discord.ui.TextInput(
         label="Item Content",
@@ -730,7 +788,11 @@ class RestockModal(discord.ui.Modal, title="Restock Single Item"):
             view=RestockView(self.product_id, interaction.user, interaction.user.roles, interaction.guild),
         )
         try:
-            channel = interaction.client.get_channel(self.channel_id) or await interaction.client.fetch_channel(self.channel_id)
+            from src.http_utils import ensure_http_client_ready
+            channel = interaction.client.get_channel(self.channel_id)
+            if channel is None:
+                await ensure_http_client_ready(interaction.client)
+                channel = await interaction.client.fetch_channel(self.channel_id)
             if channel is not None:
                 message = await channel.fetch_message(self.message_id)
                 product = get_product(DB_FILE, self.product_id)
@@ -807,7 +869,11 @@ class BulkRestockModal(discord.ui.Modal, title="Bulk Restock Items"):
             view=RestockView(self.product_id, interaction.user, interaction.user.roles, interaction.guild),
         )
         try:
-            channel = interaction.client.get_channel(self.channel_id) or await interaction.client.fetch_channel(self.channel_id)
+            from src.http_utils import ensure_http_client_ready
+            channel = interaction.client.get_channel(self.channel_id)
+            if channel is None:
+                await ensure_http_client_ready(interaction.client)
+                channel = await interaction.client.fetch_channel(self.channel_id)
             if channel is not None:
                 message = await channel.fetch_message(self.message_id)
                 product = get_product(DB_FILE, self.product_id)
